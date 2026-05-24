@@ -1,0 +1,227 @@
+{
+  "name": "Data Retention V1 Lean",
+  "description": "12-hour scheduled cleanup with bounded deletes on supervisor_events (90-day retention, LIMIT 1000), stale circuit auto-reset safety valve, ANALYZE pass, and Telegram failure caching for heartbeat pickup.",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 12
+            }
+          ]
+        }
+      },
+      "id": "trigger-schedule-ret-v1l",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH del_events AS (\n  DELETE FROM supervisor_events\n  WHERE id IN (\n    SELECT id FROM supervisor_events\n    WHERE created_at < NOW() - INTERVAL '90 days'\n    LIMIT 1000\n  )\n  RETURNING id\n),\nstale_circuit AS (\n  UPDATE circuit_state\n  SET status = 'closed', error_count = 0, updated_at = NOW()\n  WHERE circuit_key = 'supervisor'\n    AND status = 'open'\n    AND last_error_at < NOW() - INTERVAL '1 hour'\n    AND opened_at < NOW() - INTERVAL '1 hour'\n  RETURNING circuit_key\n)\nSELECT\n  (SELECT COUNT(*) FROM del_events) AS deleted_events_count,\n  (SELECT COUNT(*) > 0 FROM stale_circuit) AS stale_circuit_reset",
+        "options": {}
+      },
+      "id": "pg-cleanup-v1l",
+      "name": "Postgres (Cleanup)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        250,
+        300
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst isDbError = item.error && typeof item.error === 'object' && item.error.message;\n\nif (isDbError) {\n  return [{ json: { report: '🔴 DATA RETENTION — DB ERROR\\n\\nCleanup query failed: ' + item.error.message + '\\n\\nTimestamp: ' + new Date().toISOString(), isDbError: true, isLimitHit: false } }];\n}\n\nconst dev = parseInt(item.deleted_events_count) || 0;\nconst circuitReset = item.stale_circuit_reset === true || item.stale_circuit_reset === 't';\nconst isLimitHit = dev >= 1000;\n\nlet report = `🧹 DATA RETENTION REPORT — V1 Lean\\n\\nDeleted Events (90d): ${dev}`;\n\nif (circuitReset) {\n  report += '\\n\\n⚠️ STALE CIRCUIT RESET: Circuit was open for >1 hour with no new errors. Auto-reset to closed.';\n}\n\nif (isLimitHit) {\n  report += '\\n\\n⚠️ LIMIT HIT — Events table hit the 1000-row deletion cap. Run retention again or increase LIMIT.';\n}\n\nreport += '\\n\\nTimestamp: ' + new Date().toISOString();\n\nreturn [{ json: { report, isDbError: false, isLimitHit } }];"
+      },
+      "id": "code-eval-cleanup-v1l",
+      "name": "Evaluate Cleanup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "ANALYZE supervisor_events;\nANALYZE circuit_state;",
+        "options": {}
+      },
+      "id": "pg-analyze-v1l",
+      "name": "Postgres (Analyze)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        750,
+        300
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst evalReport = $('Evaluate Cleanup').first().json.report;\nconst analyzeError = item.error && typeof item.error === 'object' && item.error.message;\nlet report = evalReport;\nif (analyzeError) report += '\\n\\n⚠️ ANALYZE FAILED: ' + item.error.message;\nelse report += '\\n\\n✅ ANALYZE completed successfully.';\nreturn [{ json: { report } }];"
+      },
+      "id": "code-check-analyze-v1l",
+      "name": "Check Analyze Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "REPLACE_WITH_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.report }}",
+        "additionalFields": {}
+      },
+      "id": "tg-retention-report-v1l",
+      "name": "Telegram (Retention Report)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [
+        1250,
+        300
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nif (!staticData.eventFailures) staticData.eventFailures = [];\nstaticData.eventFailures.push({\n  timestamp: new Date().toISOString(),\n  event: 'retention_telegram_alert_failed',\n  source: 'Data Retention',\n  error: 'Telegram delivery failed'\n});\nif (staticData.eventFailures.length > 50) {\n  staticData.droppedCacheCount = (staticData.droppedCacheCount || 0) + (staticData.eventFailures.length - 50);\n  staticData.eventFailures = staticData.eventFailures.slice(-50);\n}\nreturn [{ json: { cached: true } }];"
+      },
+      "id": "code-cache-ret-fail-v1l",
+      "name": "Cache Retention Alert Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1500,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 🧹 Data Retention V1 Lean\n**Every 12 hours: Cleanup → Analyze → Report**\n\n- Deletes supervisor_events older than 90 days (LIMIT 1000)\n- Auto-resets stale open circuits (>1 hour safety valve)\n- ANALYZE for query planner freshness\n- Telegram report with limit-hit warning",
+        "width": 400,
+        "height": 160
+      },
+      "id": "sticky-ret-v1l",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Postgres (Cleanup)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres (Cleanup)": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Cleanup",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Evaluate Cleanup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Cleanup": {
+      "main": [
+        [
+          {
+            "node": "Postgres (Analyze)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres (Analyze)": {
+      "main": [
+        [
+          {
+            "node": "Check Analyze Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Check Analyze Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Analyze Result": {
+      "main": [
+        [
+          {
+            "node": "Telegram (Retention Report)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram (Retention Report)": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Cache Retention Alert Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "executionTimeout": 180
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "production-v1-lean"
+    },
+    {
+      "name": "supervisor"
+    },
+    {
+      "name": "data-retention"
+    }
+  ]
+}

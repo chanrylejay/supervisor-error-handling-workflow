@@ -1,0 +1,737 @@
+{
+  "name": "Heartbeat Monitor V1 Lean",
+  "description": "5-minute scheduled health monitor with circuit reset probe, error rate trend detection, dead man's switch ping, orphan execution detection, MD5 heartbeat dedup, and emergency cache pickup. Sends Telegram alerts only when system state changes.",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "trigger-schedule-hb-v1l",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH recover_open AS (\n  UPDATE circuit_state\n  SET status = 'half_open', updated_at = NOW(), half_open_at = NOW()\n  WHERE circuit_key = 'supervisor'\n    AND status = 'open'\n    AND last_error_at < NOW() - INTERVAL '5 minutes'\n  RETURNING circuit_key, status, 'open' AS previous_status\n),\nreset_half_open AS (\n  UPDATE circuit_state\n  SET status = 'closed', error_count = 0, updated_at = NOW()\n  WHERE circuit_key = 'supervisor'\n    AND status = 'half_open'\n    AND last_error_at < NOW() - INTERVAL '10 minutes'\n    AND NOT EXISTS (SELECT 1 FROM recover_open)\n  RETURNING circuit_key, status, 'half_open' AS previous_status\n)\nSELECT circuit_key, status, previous_status FROM recover_open\nUNION ALL\nSELECT circuit_key, status, previous_status FROM reset_half_open",
+        "options": {
+          "alwaysOutputData": true
+        }
+      },
+      "id": "pg-circuit-reset-v1l",
+      "name": "Circuit Reset Probe",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        250,
+        300
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nif (!item.circuit_key || !item.status || !item.previous_status) {\n  return [{ json: { hasTransition: false, transitionQuery: 'SELECT 1' } }];\n}\nconst traceId = 'heartbeat-recovery-' + Date.now();\nconst from = item.previous_status;\nconst to = item.status;\nconst transitionQuery = `INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, severity, status, payload) VALUES ('${traceId}', 'circuit_transition', 'Heartbeat Monitor', 'heartbeat', 'info', '${to}', '{\"from\": \"${from}\", \"to\": \"${to}\", \"reason\": \"heartbeat_recovery_probe\", \"cooldown_minutes\": ${from === 'open' ? 5 : 10}}')`;\nreturn [{ json: { hasTransition: true, transitionQuery, from, to } }];"
+      },
+      "id": "code-build-recovery-v1l",
+      "name": "Build Circuit Recovery Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        450,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.transitionQuery }}",
+        "options": {}
+      },
+      "id": "pg-log-recovery-v1l",
+      "name": "Log Circuit Recovery",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        650,
+        300
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  (SELECT status FROM circuit_state WHERE circuit_key = 'supervisor') AS circuit_status,\n  (SELECT error_count FROM circuit_state WHERE circuit_key = 'supervisor') AS error_count,\n  (SELECT COUNT(*) FROM supervisor_events WHERE event_type = 'error_alert' AND created_at > NOW() - INTERVAL '1 hour') AS errors_last_hour,\n  (SELECT COUNT(*) FROM supervisor_events WHERE event_type = 'error_alert' AND created_at > NOW() - INTERVAL '24 hours') AS errors_last_24h",
+        "options": {
+          "alwaysOutputData": true
+        }
+      },
+      "id": "pg-system-status-v1l",
+      "name": "System Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        850,
+        300
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst item = $input.first().json;\nconst staticData = $getWorkflowStaticData('global');\n\nconst isDbError = item.error && typeof item.error === 'object' && item.error.message;\nconst cs = isDbError ? 'unknown' : (item.circuit_status || 'unknown');\nconst ec = isDbError ? 0 : (parseInt(item.error_count) || 0);\nconst errHour = isDbError ? 0 : (parseInt(item.errors_last_hour) || 0);\nconst err24h = isDbError ? 0 : (parseInt(item.errors_last_24h) || 0);\nconst circuitIcon = cs === 'closed' ? '🟢' : cs === 'half_open' ? '🟡' : cs === 'open' ? '🔴' : '⚪';\nconst trend = errHour >= 3 ? '🔴 spike' : err24h >= 10 ? '🟡 elevated' : '🟢 stable';\n\nlet emergencyNote = '';\nconst cachedCount = (staticData.eventFailures && staticData.eventFailures.length) || 0;\nconst droppedCount = staticData.droppedCacheCount || 0;\nif (cachedCount > 0) {\n  emergencyNote = `\\n\\n🚨 Emergency Cache: ${cachedCount} failed event(s) detected since last heartbeat`;\n  if (droppedCount > 0) emergencyNote += ` (${droppedCount} older events dropped due to cache overflow)`;\n}\n\nlet dmsNote = '';\nif (staticData.lastDeadMansSwitchFailure) dmsNote = `\\n\\n⚠️ Last DMS Ping Failure: ${staticData.lastDeadMansSwitchFailure}`;\nlet orphanNote = '';\nif (staticData.orphanUncertainty) orphanNote = `\\n\\n⚠️ Orphan Detection Uncertain: ${staticData.orphanUncertainty.reason} (at ${staticData.orphanUncertainty.timestamp})`;\n\nconst text = `💓 HEARTBEAT — Supervisor V1 Lean\\n\\nCircuit: ${circuitIcon} ${cs} (${ec} errors)\\nErrors (1h): ${errHour}\\nErrors (24h): ${err24h}\\nTrend: ${trend}${isDbError ? '\\n\\n🔴 DATABASE UNREACHABLE' : ''}${emergencyNote}${dmsNote}${orphanNote}\\n\\nTimestamp: ${new Date().toISOString()}`;\n\nconst hashInput = `${cs}:${ec}:${errHour}:${err24h}:${isDbError}:${!!emergencyNote}:${!!dmsNote}:${!!orphanNote}`;\nconst messageHash = crypto.createHash('md5').update(hashInput).digest('hex');\nconst lastHash = staticData.lastHeartbeatHash || '';\nconst isDuplicate = messageHash === lastHash;\nstaticData.lastHeartbeatHash = messageHash;\nconst isDegraded = isDbError || cs === 'open' || cs === 'half_open' || !!emergencyNote || !!dmsNote || !!orphanNote;\n\nreturn [{ json: { text, messageHash, isDuplicate, isDegraded, dbError: isDbError, circuit_status: cs, error_count: ec, errors_last_hour: errHour, errors_last_24h: err24h } }];"
+      },
+      "id": "code-eval-health-v1l",
+      "name": "Evaluate System Health",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.HEALTHCHECKS_PING_URL }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "http-dms-v1l",
+      "name": "HTTP (DMS Ping)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1350,
+        300
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json || {};\nconst isError = (typeof item.error === 'object' && item.error !== null && item.error.message);\nif (isError) {\n  const staticData = $getWorkflowStaticData('global');\n  staticData.lastDeadMansSwitchFailure = item.error.message;\n}\nreturn [{ json: { ...item, dmsFailure: isError, dmsErrorMessage: isError ? item.error.message : '' } }];"
+      },
+      "id": "code-check-dms-v1l",
+      "name": "Check DMS Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1550,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "dms-fail-cond-v1l",
+              "leftValue": "={{ $json.dmsFailure }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-dms-failed-v1l",
+      "name": "Has DMS Failed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1750,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "REPLACE_WITH_TELEGRAM_CHAT_ID",
+        "text": "=🔴 DEAD MAN'S SWITCH FAILURE\n\nHealthchecks.io ping failed!\nError: {{ $json.dmsErrorMessage }}\n\nTimestamp: {{ $now.toISO() }}\n\n⚠️ External monitoring may be offline.",
+        "additionalFields": {}
+      },
+      "id": "tg-dms-failure-v1l",
+      "name": "Telegram (DMS Failure)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [
+        1950,
+        150
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "should-send-cond-v1l",
+              "leftValue": "={{ $('Evaluate System Health').first().json.dbError || ($('Evaluate System Health').first().json.isDegraded && !$('Evaluate System Health').first().json.isDuplicate) || (!$('Evaluate System Health').first().json.isDegraded && !$('Evaluate System Health').first().json.isDuplicate && new Date().getMinutes() < 5) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-should-send-v1l",
+      "name": "Should Send?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1950,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "REPLACE_WITH_TELEGRAM_CHAT_ID",
+        "text": "={{ $('Evaluate System Health').first().json.text }}",
+        "additionalFields": {}
+      },
+      "id": "tg-heartbeat-v1l",
+      "name": "Telegram (Heartbeat)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [
+        2200,
+        250
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nstaticData.eventFailures = [];\nstaticData.droppedCacheCount = 0;\ndelete staticData.lastDeadMansSwitchFailure;\ndelete staticData.orphanUncertainty;\nreturn [{ json: { cacheCleared: true } }];"
+      },
+      "id": "code-clear-cache-v1l",
+      "name": "Clear Emergency Cache",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "http://localhost:5678/api/v1/executions?status=running&limit=100",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "http-running-exec-v1l",
+      "name": "HTTP (Running Executions)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1950,
+        500
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst staticData = $getWorkflowStaticData('global');\n\nif (item.error || (typeof item === 'object' && item.error)) {\n  return [{ json: { apiError: true, hasOrphans: false, orphans: [], orphanQuery: 'SELECT 1', errorMessage: item.error?.message || 'API unreachable' } }];\n}\n\nconst data = item.data || item;\nconst arr = Array.isArray(data) ? data : (data.data || []);\n\nif (arr.length === 0) {\n  const healthData = (() => { try { return $('Evaluate System Health').first().json; } catch(e) { return {}; } })();\n  const isActiveSystem = healthData.circuit_status === 'open' || healthData.circuit_status === 'half_open' || healthData.dbError;\n  if (isActiveSystem) {\n    staticData.orphanUncertainty = { timestamp: new Date().toISOString(), reason: 'API returned 0 running executions during active system (circuit: ' + (healthData.circuit_status || 'unknown') + ')' };\n    return [{ json: { apiError: false, hasOrphans: false, orphans: [], orphanQuery: 'SELECT 1', uncertainResult: true } }];\n  }\n  return [{ json: { apiError: false, hasOrphans: false, orphans: [], orphanQuery: 'SELECT 1' } }];\n}\n\nconst now = Date.now();\nconst threshold = 30 * 60 * 1000;\nconst MONITORING_WORKFLOW_IDS = [\n  $env.SUPERVISOR_WORKFLOW_ID || '',\n  $env.HEARTBEAT_WORKFLOW_ID || '',\n  $env.RETENTION_WORKFLOW_ID || ''\n].filter(Boolean);\n\nconst orphans = arr.filter(exec => {\n  const startedAt = new Date(exec.startedAt || exec.createdAt).getTime();\n  return (now - startedAt) > threshold && !MONITORING_WORKFLOW_IDS.includes(String(exec.workflowId));\n}).map(exec => ({\n  executionId: exec.id,\n  workflowId: exec.workflowId,\n  workflowName: exec.workflowName || 'unknown',\n  startedAt: exec.startedAt || exec.createdAt,\n  runningMinutes: Math.round((now - new Date(exec.startedAt || exec.createdAt).getTime()) / 60000)\n}));\n\nconst esc = (s) => String(s ?? '').replace(/'/g, \"''\");\nlet orphanQuery = 'SELECT 1';\nif (orphans.length > 0) {\n  const values = orphans.map(o => {\n    const payload = JSON.stringify({ orphanCount: orphans.length, runningMinutes: o.runningMinutes, workflowId: o.workflowId }).replace(/'/g, \"''\");\n    return `('orphan-${o.executionId}-' || EXTRACT(EPOCH FROM NOW())::INTEGER, 'orphan_detected', '${esc(o.workflowName)}', '${o.executionId}', 'warning', 'detected', '${payload}')`;\n  }).join(',\\n  ');\n  orphanQuery = `INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, severity, status, payload)\\nVALUES\\n  ${values}\\nON CONFLICT DO NOTHING`;\n}\n\nreturn [{ json: { apiError: false, hasOrphans: orphans.length > 0, orphans, orphanCount: orphans.length, orphanQuery } }];"
+      },
+      "id": "code-detect-orphans-v1l",
+      "name": "Detect Orphans",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "api-error-cond-v1l",
+              "leftValue": "={{ $json.apiError }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-api-error-v1l",
+      "name": "Has API Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2450,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "REPLACE_WITH_TELEGRAM_CHAT_ID",
+        "text": "=🔴 HEARTBEAT — API UNREACHABLE\n\nn8n API at localhost:5678 is not responding.\nOrphan detection skipped this cycle.\n\nError: {{ $json.errorMessage }}\n\nTimestamp: {{ $now.toISO() }}",
+        "additionalFields": {}
+      },
+      "id": "tg-api-error-v1l",
+      "name": "Telegram (API Error)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [
+        2700,
+        400
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "has-orphans-cond-v1l",
+              "leftValue": "={{ $json.hasOrphans }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-has-orphans-v1l",
+      "name": "Has Orphans?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2700,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.orphanQuery }}",
+        "options": {}
+      },
+      "id": "pg-log-orphans-v1l",
+      "name": "Log Orphans",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2950,
+        550
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "chatId": "REPLACE_WITH_TELEGRAM_CHAT_ID",
+        "text": "=⚠️ ORPHAN EXECUTION DETECTED\n\n{{ $('Detect Orphans').first().json.orphans.map(o => 'Execution: ' + o.executionId + '\\nWorkflow: ' + o.workflowName + '\\nRunning: ' + o.runningMinutes + ' minutes').join('\\n---\\n') }}\n\nTotal orphans: {{ $('Detect Orphans').first().json.orphanCount }}\n\nTimestamp: {{ $now.toISO() }}",
+        "additionalFields": {}
+      },
+      "id": "tg-orphan-alert-v1l",
+      "name": "Telegram (Orphan Alert)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [
+        3200,
+        550
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nif (!staticData.eventFailures) staticData.eventFailures = [];\nstaticData.eventFailures.push({\n  timestamp: new Date().toISOString(),\n  event: 'heartbeat_alert_failed',\n  source: 'Heartbeat Monitor',\n  error: 'Telegram or Postgres delivery failed'\n});\nif (staticData.eventFailures.length > 50) {\n  staticData.droppedCacheCount = (staticData.droppedCacheCount || 0) + (staticData.eventFailures.length - 50);\n  staticData.eventFailures = staticData.eventFailures.slice(-50);\n}\nreturn [{ json: { cached: true } }];"
+      },
+      "id": "code-cache-hb-fail-v1l",
+      "name": "Cache Alert Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2700,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 💓 Heartbeat Monitor V1 Lean\n**5-min schedule → Circuit reset → System status → DMS ping → Orphan detection**\n\n- Error rate trend: errors/1h, errors/24h with 🟢🟡🔴 indicators\n- MD5 dedup: \"no news = good news\" — only sends on state change\n- Hourly healthy heartbeat (when minutes < 5)\n- Emergency cache pickup from all workflows\n- Orphan detection excludes monitoring workflow IDs via $env",
+        "width": 420,
+        "height": 180
+      },
+      "id": "sticky-info-hb-v1l",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Circuit Reset Probe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Circuit Reset Probe": {
+      "main": [
+        [
+          {
+            "node": "Build Circuit Recovery Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Circuit Recovery Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Circuit Recovery Event": {
+      "main": [
+        [
+          {
+            "node": "Log Circuit Recovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Circuit Recovery": {
+      "main": [
+        [
+          {
+            "node": "System Status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "System Status",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Cache Alert Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "System Status": {
+      "main": [
+        [
+          {
+            "node": "Evaluate System Health",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Evaluate System Health",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate System Health": {
+      "main": [
+        [
+          {
+            "node": "HTTP (DMS Ping)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP (DMS Ping)": {
+      "main": [
+        [
+          {
+            "node": "Check DMS Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Check DMS Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check DMS Result": {
+      "main": [
+        [
+          {
+            "node": "Has DMS Failed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has DMS Failed?": {
+      "main": [
+        [
+          {
+            "node": "Telegram (DMS Failure)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Should Send?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "HTTP (Running Executions)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Should Send?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "HTTP (Running Executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Send?": {
+      "main": [
+        [
+          {
+            "node": "Telegram (Heartbeat)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Telegram (Heartbeat)": {
+      "main": [
+        [
+          {
+            "node": "Clear Emergency Cache",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Cache Alert Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram (DMS Failure)": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Cache Alert Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP (Running Executions)": {
+      "main": [
+        [
+          {
+            "node": "Detect Orphans",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Detect Orphans",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect Orphans": {
+      "main": [
+        [
+          {
+            "node": "Has API Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has API Error?": {
+      "main": [
+        [
+          {
+            "node": "Telegram (API Error)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Has Orphans?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram (API Error)": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Cache Alert Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Orphans?": {
+      "main": [
+        [
+          {
+            "node": "Log Orphans",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Log Orphans": {
+      "main": [
+        [
+          {
+            "node": "Telegram (Orphan Alert)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Telegram (Orphan Alert)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Cache Alert Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram (Orphan Alert)": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Cache Alert Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "executionTimeout": 120
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "production-v1-lean"
+    },
+    {
+      "name": "supervisor"
+    },
+    {
+      "name": "heartbeat"
+    }
+  ]
+}
