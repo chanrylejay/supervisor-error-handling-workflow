@@ -1,6 +1,6 @@
 {
   "name": "Supervisor Core V1 Lean",
-  "description": "Primary error monitoring workflow. Receives errors via Error Trigger, normalizes with severity inference and credential sanitization, debounces duplicates, manages circuit breaker, guards against self-loops, and sends formatted Telegram alerts with escalation awareness. All failures cache to staticData for heartbeat pickup.",
+  "description": "Primary error monitoring workflow. Receives errors via Error Trigger, enriches and classifies payloads, sanitizes credentials, handles trigger-node error shapes, self-loop guards before circuit logic, debounces duplicates with burst counts, manages atomic circuit breaker with transition logging, sends HTML Telegram alerts, logs events, and performs safe auto-retry for retryable transient errors.",
   "nodes": [
     {
       "parameters": {},
@@ -8,192 +8,27 @@
       "name": "Error Trigger",
       "type": "n8n-nodes-base.errorTrigger",
       "typeVersion": 1,
-      "position": [
-        250,
-        500
-      ]
+      "position": [250, 500]
     },
     {
       "parameters": {
-        "jsCode": "const item = $input.first().json;\n\nfunction sanitize(text) {\n  return (text || '')\n    .replace(/postgres(ql)?:\\/\\/[^\\s]+/gi, '[REDACTED_DB_URL]')\n    .replace(/[A-Za-z0-9_-]{20,}\\.[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{20,}/g, '[REDACTED_TOKEN]')\n    .replace(/(?:key|token|secret|password|apikey)[\\s]*[=:]\\s*\\S+/gi, '[REDACTED_CREDENTIAL]')\n    .replace(/sk-[a-zA-Z0-9]{20,}/g, '[REDACTED_API_KEY]');\n}\n\nconst executionId = item.execution?.id || item.executionId || 'unknown';\nconst workflowName = item.workflow?.name || item.workflowName || 'unknown';\nconst workflowId = item.workflow?.id || item.workflowId || 'unknown';\nconst rawError = item.execution?.error?.message || item.errorMessage || 'No error message available';\nconst failedNode = item.execution?.lastNodeExecuted || item.failedNode || 'unknown';\nconst executionUrl = item.execution?.url || 'http://localhost:5678/executions/' + executionId;\n\nconst msg = rawError.toLowerCase();\nconst severity = /credentials|auth|forbidden|401|403/.test(msg) ? 'critical' : /timeout|econnrefused|enotfound|502|503/.test(msg) ? 'warning' : /rate.?limit|429|quota/.test(msg) ? 'warning' : /cannot read prop|undefined|null|typeerror/.test(msg) ? 'error' : 'error';\nconst severityIcon = severity === 'critical' ? '🔴' : severity === 'warning' ? '🟡' : '🟠';\n\nconst errorMessage = sanitize(rawError).substring(0, 1000);\nconst retryable = !(/credentials|auth|forbidden/i.test(rawError));\n\nreturn [{ json: { executionId, workflowName, workflowId, errorMessage, failedNode, executionUrl, severity, severityIcon, retryable, workflow_version: 'v1_lean' } }];"
+        "jsCode": "const item = $input.first().json;\nconst staticData = $getWorkflowStaticData('global');\n\nfunction sanitize(text) {\n  return String(text || '')\n    .replace(/postgres(ql)?:\\/\\/[^\\s]+/gi, '[REDACTED_DB_URL]')\n    .replace(/[A-Za-z0-9_-]{20,}\\.[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{20,}/g, '[REDACTED_TOKEN]')\n    .replace(/(?:key|token|secret|password|apikey)[\\s]*[=:]\\s*\\S+/gi, '[REDACTED_CREDENTIAL]')\n    .replace(/sk-[a-zA-Z0-9]{20,}/g, '[REDACTED_API_KEY]');\n}\n\nfunction safeId(value, fallback = 'unknown') {\n  const v = value === undefined || value === null || value === '' ? fallback : value;\n  return String(v);\n}\n\nconst execution = item.execution || {};\nconst trigger = item.trigger || {};\nconst workflow = item.workflow || {};\nconst triggerError = trigger.error || {};\nconst executionError = execution.error || {};\n\nconst executionId = safeId(execution.id || item.executionId || 'unknown');\nconst workflowName = safeId(workflow.name || item.workflowName || 'unknown');\nconst workflowId = safeId(workflow.id || item.workflowId || 'unknown');\n\nconst rawError =\n  executionError.message ||\n  executionError.cause?.message ||\n  triggerError.message ||\n  triggerError.cause?.message ||\n  item.errorMessage ||\n  'No error message available';\n\nconst failedNode = safeId(\n  execution.lastNodeExecuted ||\n  executionError.node?.name ||\n  triggerError.node?.name ||\n  item.failedNode ||\n  'trigger_or_unknown'\n);\n\nconst baseUrl = $env.N8N_BASE_URL || 'http://localhost:5678';\nconst executionUrl = execution.url || (executionId !== 'unknown' ? `${baseUrl}/executions/${executionId}` : `${baseUrl}/executions`);\nconst retryOf = execution.retryOf || item.retryOf || null;\nconst executionMode = execution.mode || trigger.mode || item.mode || 'unknown';\n\nconst msg = String(rawError || '').toLowerCase();\n\nconst category = /credentials|credential|auth|unauthorized|forbidden|401|403/.test(msg)\n  ? 'auth'\n  : /rate.?limit|429|quota/.test(msg)\n    ? 'rate_limit'\n    : /timeout|etimedout|504/.test(msg)\n      ? 'timeout'\n      : /econnrefused|enotfound|econnreset|network|502|503/.test(msg)\n        ? 'connectivity'\n        : /cannot read prop|undefined|null|typeerror|referenceerror|syntaxerror/.test(msg)\n          ? 'code_bug'\n          : /memory|heap|out of memory/.test(msg)\n            ? 'resource'\n            : 'unknown';\n\nconst severity = category === 'auth'\n  ? 'critical'\n  : ['rate_limit', 'timeout', 'connectivity', 'resource'].includes(category)\n    ? 'warning'\n    : 'error';\n\nconst severityIcon = severity === 'critical' ? '🔴' : severity === 'warning' ? '🟡' : '🟠';\nconst errorMessage = sanitize(rawError).substring(0, 1000);\nconst retryable = ['connectivity', 'rate_limit', 'timeout'].includes(category) && !retryOf && !(/credentials|credential|auth|unauthorized|forbidden|401|403/i.test(rawError));\n\nconst now = Date.now();\nconst traceId = `err-${executionId}-${now}`;\nconst fingerprint = `${workflowName}::${failedNode}::${errorMessage.substring(0, 100)}`\n  .toLowerCase()\n  .replace(/[^a-z0-9:]/g, '_')\n  .substring(0, 250);\n\nconst debounceKey = 'debounce_' + fingerprint;\nconst burstKey = 'burst_' + fingerprint;\nconst lastSeen = staticData[debounceKey] || 0;\nconst isDebounced = (now - lastSeen) < 30000;\n\nlet burstSuppressedCount = staticData[burstKey] || 0;\n\nif (isDebounced) {\n  burstSuppressedCount += 1;\n  staticData[burstKey] = burstSuppressedCount;\n} else {\n  staticData[debounceKey] = now;\n  staticData[burstKey] = 0;\n}\n\nfor (const k of Object.keys(staticData)) {\n  if (k.startsWith('debounce_') && (now - staticData[k]) > 300000) delete staticData[k];\n  if (k.startsWith('burst_') && staticData[k] === 0) delete staticData[k];\n}\n\nreturn [{\n  json: {\n    executionId,\n    workflowName,\n    workflowId,\n    errorMessage,\n    rawError: sanitize(rawError).substring(0, 1000),\n    failedNode,\n    executionUrl,\n    severity,\n    severityIcon,\n    category,\n    retryable,\n    retryOf,\n    executionMode,\n    traceId,\n    fingerprint,\n    isDebounced,\n    burstSuppressedCount,\n    workflow_version: 'v1_lean'\n  }\n}];"
       },
-      "id": "code-normalize-v1l",
-      "name": "Normalize Error Payload",
+      "id": "code-enrich-classify-v1l",
+      "name": "Enrich & Classify",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [
-        500,
-        500
-      ]
+      "position": [500, 500]
     },
     {
       "parameters": {
-        "jsCode": "const item = $input.first().json;\nconst staticData = $getWorkflowStaticData('global');\n\nconst traceId = 'err-' + item.executionId + '-' + Date.now();\nconst fingerprint = (item.workflowName + '::' + item.failedNode + '::' + item.errorMessage.substring(0, 100)).toLowerCase().replace(/[^a-z0-9:]/g, '_');\n\nconst lastSeen = staticData['debounce_' + fingerprint] || 0;\nconst now = Date.now();\nconst isDebounced = (now - lastSeen) < 30000;\n\nif (!isDebounced) {\n  staticData['debounce_' + fingerprint] = now;\n}\n\nconst keys = Object.keys(staticData).filter(k => k.startsWith('debounce_'));\nfor (const k of keys) {\n  if ((now - staticData[k]) > 300000) delete staticData[k];\n}\n\nreturn [{ json: { ...item, traceId, fingerprint, isDebounced } }];"
-      },
-      "id": "code-gen-ctx-v1l",
-      "name": "Generate Context",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        750,
-        500
-      ]
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict"
-          },
-          "conditions": [
-            {
-              "id": "debounce-cond-v1l",
-              "leftValue": "={{ $json.isDebounced }}",
-              "rightValue": true,
-              "operator": {
-                "type": "boolean",
-                "operation": "equals"
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      },
-      "id": "if-debounced-v1l",
-      "name": "Is Debounced?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2,
-      "position": [
-        1000,
-        500
-      ]
-    },
-    {
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "=INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, failed_node, severity, status, fingerprint, payload)\nVALUES (\n  '{{ $json.traceId }}',\n  'error_debounced',\n  '{{ $json.workflowName.replace(/'/g, \"''\") }}',\n  '{{ $json.executionId }}',\n  '{{ $json.failedNode.replace(/'/g, \"''\") }}',\n  'info',\n  'suppressed',\n  '{{ $json.fingerprint }}',\n  '{\"reason\": \"30s debounce window\"}'\n)",
-        "options": {}
-      },
-      "id": "pg-log-debounced-v1l",
-      "name": "Log Debounced Event",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
-      "position": [
-        1250,
-        350
-      ],
-      "onError": "continueErrorOutput"
-    },
-    {
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "=WITH current AS (\n  SELECT status, error_count, opened_at\n  FROM circuit_state\n  WHERE circuit_key = 'supervisor'\n  FOR UPDATE\n),\nupserted AS (\n  INSERT INTO circuit_state (circuit_key, status, error_count, last_error_at, updated_at)\n  VALUES ('supervisor', 'closed', 1, NOW(), NOW())\n  ON CONFLICT (circuit_key) DO UPDATE SET\n    error_count = CASE\n      WHEN circuit_state.status = 'closed' THEN circuit_state.error_count + 1\n      WHEN circuit_state.status = 'half_open' THEN circuit_state.error_count + 1\n      ELSE circuit_state.error_count\n    END,\n    status = CASE\n      WHEN circuit_state.status = 'closed' AND circuit_state.error_count + 1 >= 5 THEN 'open'\n      WHEN circuit_state.status = 'half_open' THEN 'open'\n      ELSE circuit_state.status\n    END,\n    opened_at = CASE\n      WHEN circuit_state.status = 'closed' AND circuit_state.error_count + 1 >= 5 THEN NOW()\n      WHEN circuit_state.status = 'half_open' THEN NOW()\n      ELSE circuit_state.opened_at\n    END,\n    last_error_at = NOW(),\n    updated_at = NOW()\n  RETURNING *\n)\nSELECT u.status, u.error_count, u.opened_at, (SELECT status FROM current) AS previous_status\nFROM upserted u",
-        "options": {
-          "alwaysOutputData": true
-        }
-      },
-      "id": "pg-atomic-circuit-v1l",
-      "name": "Atomic Circuit Update",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
-      "position": [
-        1250,
-        600
-      ],
-      "onError": "continueErrorOutput"
-    },
-    {
-      "parameters": {
-        "jsCode": "const circuitData = $input.first().json;\nconst errorData = $('Generate Context').first().json;\n\nconst status = circuitData.status || 'unknown';\nconst previousStatus = circuitData.previous_status || 'unknown';\nconst errorCount = circuitData.error_count || 0;\nconst isTransition = status !== previousStatus;\nconst isDbError = !circuitData.status;\n\nconst esc = (s) => String(s ?? '').replace(/'/g, \"''\");\n\nlet transitionQuery = 'SELECT 1';\nif (isTransition && !isDbError) {\n  transitionQuery = `INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, severity, status, fingerprint, payload) VALUES ('${esc(errorData.traceId)}', 'circuit_transition', '${esc(errorData.workflowName)}', '${esc(errorData.executionId)}', 'warning', '${status}', '${esc(errorData.fingerprint)}', '{\"from\": \"${previousStatus}\", \"to\": \"${status}\", \"error_count\": ${errorCount}}')`;\n}\n\nreturn [{ json: { ...errorData, circuit_status: status, previous_status: previousStatus, error_count: errorCount, is_circuit_open: status === 'open', is_transition: isTransition, is_db_error: isDbError, transitionQuery } }];"
-      },
-      "id": "code-merge-circuit-v1l",
-      "name": "Merge Circuit Result",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        1500,
-        600
-      ]
-    },
-    {
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "={{ $json.transitionQuery }}",
-        "options": {}
-      },
-      "id": "pg-log-transition-v1l",
-      "name": "Log Circuit Transition",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
-      "position": [
-        1750,
-        600
-      ],
-      "onError": "continueErrorOutput"
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict"
-          },
-          "conditions": [
-            {
-              "id": "circuit-open-cond-v1l",
-              "leftValue": "={{ $('Merge Circuit Result').first().json.is_circuit_open }}",
-              "rightValue": true,
-              "operator": {
-                "type": "boolean",
-                "operation": "equals"
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      },
-      "id": "if-circuit-open-v1l",
-      "name": "Is Circuit Open?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2,
-      "position": [
-        2000,
-        600
-      ]
-    },
-    {
-      "parameters": {
-        "chatId": "REPLACE_WITH_TELEGRAM_CHAT_ID",
-        "text": "=🔴 CIRCUIT BREAKER OPEN\n\nError count: {{ $('Merge Circuit Result').first().json.error_count }}\nLast error: {{ $('Merge Circuit Result').first().json.workflowName }} → {{ $('Merge Circuit Result').first().json.failedNode }}\nError: {{ $('Merge Circuit Result').first().json.errorMessage.substring(0, 500) }}\nTrace: {{ $('Merge Circuit Result').first().json.traceId }}\n\n⚠️ All new errors will be suppressed until circuit resets.",
-        "additionalFields": {}
-      },
-      "id": "tg-circuit-breaker-v1l",
-      "name": "Telegram (Circuit Breaker)",
-      "type": "n8n-nodes-base.telegram",
-      "typeVersion": 1.1,
-      "position": [
-        2250,
-        450
-      ],
-      "onError": "continueErrorOutput"
-    },
-    {
-      "parameters": {
-        "jsCode": "const item = $input.first().json;\nconst MONITORING_WORKFLOW_IDS = [\n  $env.SUPERVISOR_WORKFLOW_ID || '',\n  $env.HEARTBEAT_WORKFLOW_ID || '',\n  $env.RETENTION_WORKFLOW_ID || ''\n].filter(Boolean);\n\nconst monitoringNames = ['Supervisor Core', 'Heartbeat Monitor', 'Data Retention'];\n\nconst isSelfLoop = MONITORING_WORKFLOW_IDS.includes(item.workflowId) ||\n  monitoringNames.some(n => (item.workflowName || '').toLowerCase().includes(n.toLowerCase()));\n\nreturn [{ json: { ...item, isSelfLoop } }];"
+        "jsCode": "const item = $input.first().json;\nconst MONITORING_WORKFLOW_IDS = [\n  $env.SUPERVISOR_WORKFLOW_ID || '',\n  $env.HEARTBEAT_WORKFLOW_ID || '',\n  $env.RETENTION_WORKFLOW_ID || ''\n].filter(Boolean).map(String);\n\nconst monitoringNames = ['Supervisor Core', 'Heartbeat Monitor', 'Data Retention'];\n\nconst isSelfLoop = MONITORING_WORKFLOW_IDS.includes(String(item.workflowId)) ||\n  monitoringNames.some(n => String(item.workflowName || '').toLowerCase().includes(n.toLowerCase()));\n\nreturn [{ json: { ...item, isSelfLoop } }];"
       },
       "id": "code-self-loop-v1l",
       "name": "Self-Loop Check",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [
-        2250,
-        700
-      ]
+      "position": [750, 500]
     },
     {
       "parameters": {
@@ -222,115 +57,310 @@
       "name": "Is Self Loop?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [
-        2500,
-        700
-      ]
+      "position": [1000, 500]
     },
     {
       "parameters": {
-        "chatId": "REPLACE_WITH_TELEGRAM_CHAT_ID",
-        "text": "=🔁 SELF-LOOP DETECTED\n\nThe Supervisor caught an error from its own monitoring workflows.\n\nWorkflow: {{ $json.workflowName }}\nFailed Node: {{ $json.failedNode }}\nError: {{ $json.errorMessage.substring(0, 500) }}\nTrace: {{ $json.traceId }}\n\n⚠️ Suppressed to prevent infinite error loops.",
-        "additionalFields": {}
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "=🔁 <b>SELF-LOOP DETECTED</b>\n\nThe Supervisor caught an error from its own monitoring workflows.\n\n<b>Workflow:</b> {{ $json.workflowName }}\n<b>Failed Node:</b> {{ $json.failedNode }}\n<b>Category:</b> {{ $json.category }}\n<b>Error:</b> <code>{{ $json.errorMessage.substring(0, 500) }}</code>\n<b>Trace:</b> <code>{{ $json.traceId }}</code>\n\n⚠️ Suppressed before debounce/circuit logic to prevent monitoring failures from poisoning the main circuit.",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
       },
       "id": "tg-self-loop-v1l",
       "name": "Telegram (Self-Loop Alert)",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.1,
-      "position": [
-        2750,
-        550
-      ],
+      "position": [1250, 350],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "=INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, failed_node, severity, status, fingerprint, payload)\nVALUES (\n  '{{ $json.traceId }}',\n  'error_self_loop',\n  '{{ $json.workflowName.replace(/'/g, \"''\") }}',\n  '{{ $json.executionId }}',\n  '{{ $json.failedNode.replace(/'/g, \"''\") }}',\n  'warning',\n  'suppressed',\n  '{{ $json.fingerprint }}',\n  '{\"reason\": \"self_loop_detected\"}'\n)",
-        "options": {}
+        "query": "INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, failed_node, severity, status, fingerprint, payload)\nVALUES ($1, 'error_self_loop', $2, $3, $4, 'warning', 'suppressed', $5, $6::jsonb)",
+        "options": {
+          "queryReplacement": "={{ $json.traceId }},{{ $json.workflowName }},{{ $json.executionId }},{{ $json.failedNode }},{{ $json.fingerprint }},{{ JSON.stringify({ reason: 'self_loop_detected', category: $json.category, executionMode: $json.executionMode }) }}"
+        }
       },
       "id": "pg-log-self-loop-v1l",
       "name": "Log Self-Loop Event",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [
-        3000,
-        550
-      ],
+      "position": [1500, 350],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "const item = $input.first().json;\n\nconst text = `${item.severityIcon} ${item.severity.toUpperCase()} — WORKFLOW ERROR\n\nWorkflow: ${item.workflowName}\nFailed Node: ${item.failedNode}\nError: ${item.errorMessage.substring(0, 500)}\nExecution: ${item.executionUrl}\nRetryable: ${item.retryable ? 'yes' : 'no'}\nCircuit: Error ${item.error_count} of 5\n\nTrace: ${item.traceId}\nTimestamp: ${new Date().toISOString()}`;\n\nreturn [{ json: { ...item, alertText: text } }];"
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "debounce-cond-v1l",
+              "leftValue": "={{ $json.isDebounced }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
       },
-      "id": "code-fmt-alert-v1l",
-      "name": "Format Alert Message",
-      "type": "n8n-nodes-base.code",
+      "id": "if-debounced-v1l",
+      "name": "Is Debounced?",
+      "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [
-        2750,
-        800
-      ]
+      "position": [1250, 650]
     },
     {
       "parameters": {
-        "chatId": "REPLACE_WITH_TELEGRAM_CHAT_ID",
-        "text": "={{ $json.alertText }}",
-        "additionalFields": {}
+        "operation": "executeQuery",
+        "query": "INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, failed_node, severity, status, fingerprint, payload)\nVALUES ($1, 'error_debounced', $2, $3, $4, 'info', 'suppressed', $5, $6::jsonb)",
+        "options": {
+          "queryReplacement": "={{ $json.traceId }},{{ $json.workflowName }},{{ $json.executionId }},{{ $json.failedNode }},{{ $json.fingerprint }},{{ JSON.stringify({ reason: '30s debounce window', burstSuppressedCount: $json.burstSuppressedCount, category: $json.category }) }}"
+        }
       },
-      "id": "tg-send-alert-v1l",
-      "name": "Telegram (Send Alert)",
-      "type": "n8n-nodes-base.telegram",
-      "typeVersion": 1.1,
-      "position": [
-        3000,
-        800
-      ],
+      "id": "pg-log-debounced-v1l",
+      "name": "Log Debounced Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1500, 550],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "=INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, failed_node, severity, status, fingerprint, payload)\nVALUES (\n  '{{ $json.traceId }}',\n  'error_alert',\n  '{{ $json.workflowName.replace(/'/g, \"''\") }}',\n  '{{ $json.executionId }}',\n  '{{ $json.failedNode.replace(/'/g, \"''\") }}',\n  '{{ $json.severity }}',\n  'sent',\n  '{{ $json.fingerprint }}',\n  '{\"retryable\": {{ $json.retryable }}, \"error_count\": {{ $json.error_count }}}'\n)",
+        "query": "=WITH current AS (\n  SELECT status, error_count, opened_at\n  FROM circuit_state\n  WHERE circuit_key = 'supervisor'\n  FOR UPDATE\n),\nupserted AS (\n  INSERT INTO circuit_state (circuit_key, status, error_count, last_error_at, updated_at)\n  VALUES ('supervisor', 'closed', 1, NOW(), NOW())\n  ON CONFLICT (circuit_key) DO UPDATE SET\n    error_count = CASE\n      WHEN circuit_state.status = 'closed' THEN circuit_state.error_count + 1\n      WHEN circuit_state.status = 'half_open' THEN circuit_state.error_count + 1\n      ELSE circuit_state.error_count\n    END,\n    status = CASE\n      WHEN circuit_state.status = 'closed' AND circuit_state.error_count + 1 >= 5 THEN 'open'\n      WHEN circuit_state.status = 'half_open' THEN 'open'\n      ELSE circuit_state.status\n    END,\n    opened_at = CASE\n      WHEN circuit_state.status = 'closed' AND circuit_state.error_count + 1 >= 5 THEN NOW()\n      WHEN circuit_state.status = 'half_open' THEN NOW()\n      ELSE circuit_state.opened_at\n    END,\n    last_error_at = NOW(),\n    updated_at = NOW()\n  RETURNING *\n),\ntransition_log AS (\n  INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, severity, status, fingerprint, payload)\n  SELECT\n    '{{ $json.traceId.replace(/'/g, \"''\") }}',\n    'circuit_transition',\n    '{{ $json.workflowName.replace(/'/g, \"''\") }}',\n    '{{ $json.executionId.replace(/'/g, \"''\") }}',\n    'warning',\n    u.status,\n    '{{ $json.fingerprint.replace(/'/g, \"''\") }}',\n    jsonb_build_object(\n      'from', c.status,\n      'to', u.status,\n      'error_count', u.error_count,\n      'workflow_name', '{{ $json.workflowName.replace(/'/g, \"''\") }}',\n      'workflow_id', '{{ $json.workflowId.replace(/'/g, \"''\") }}',\n      'failed_node', '{{ $json.failedNode.replace(/'/g, \"''\") }}',\n      'fingerprint', '{{ $json.fingerprint.replace(/'/g, \"''\") }}',\n      'category', '{{ $json.category.replace(/'/g, \"''\") }}'\n    )\n  FROM upserted u\n  JOIN current c ON TRUE\n  WHERE c.status IS NOT NULL AND u.status <> c.status\n  RETURNING id\n)\nSELECT\n  u.status,\n  u.error_count,\n  u.opened_at,\n  c.status AS previous_status,\n  EXISTS (SELECT 1 FROM transition_log) AS transition_logged\nFROM upserted u\nLEFT JOIN current c ON TRUE",
+        "options": {
+          "alwaysOutputData": true
+        }
+      },
+      "id": "pg-atomic-circuit-v1l",
+      "name": "Atomic Circuit Update",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1500, 750],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const circuitData = $input.first().json || {};\nconst errorData = $('Self-Loop Check').first().json;\n\nconst isDbError = !!(circuitData.error && typeof circuitData.error === 'object' && circuitData.error.message) || !circuitData.status;\nconst status = isDbError ? 'unknown' : String(circuitData.status || 'unknown');\nconst previousStatus = isDbError ? 'unknown' : String(circuitData.previous_status || status);\nconst errorCount = isDbError ? 0 : (parseInt(circuitData.error_count, 10) || 0);\nconst isTransition = !isDbError && !!circuitData.previous_status && status !== previousStatus;\nconst isCircuitOpen = status === 'open';\nconst isNewlyOpen = isTransition && status === 'open';\nconst isCircuitSuppressing = isCircuitOpen && !isNewlyOpen;\n\nreturn [{\n  json: {\n    ...errorData,\n    circuit_status: status,\n    previous_status: previousStatus,\n    error_count: errorCount,\n    is_transition: isTransition,\n    transition_logged: !!circuitData.transition_logged,\n    is_circuit_open: isCircuitOpen,\n    is_newly_open: isNewlyOpen,\n    is_circuit_suppressing: isCircuitSuppressing,\n    is_db_error: isDbError,\n    db_error_message: circuitData.error?.message || ''\n  }\n}];"
+      },
+      "id": "code-merge-circuit-v1l",
+      "name": "Merge Circuit Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1750, 750]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "newly-open-cond-v1l",
+              "leftValue": "={{ $json.is_newly_open }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
         "options": {}
+      },
+      "id": "if-newly-open-v1l",
+      "name": "Is Circuit Newly Open?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2000, 750]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "=🔴 <b>CIRCUIT BREAKER OPEN</b>\n\n<b>Error Count:</b> {{ $json.error_count }} of 5\n<b>Triggered By:</b> {{ $json.workflowName }} → {{ $json.failedNode }}\n<b>Category:</b> {{ $json.category }}\n<b>Error:</b> <code>{{ $json.errorMessage.substring(0, 500) }}</code>\n<b>Trace:</b> <code>{{ $json.traceId }}</code>\n\n⚠️ New errors will be suppressed until the circuit resets.",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "tg-circuit-breaker-v1l",
+      "name": "Telegram (Circuit Breaker)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [2250, 550],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "=INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, failed_node, severity, status, fingerprint, payload)\nVALUES (\n  '{{ $json.traceId.replace(/'/g, \"''\") }}',\n  'circuit_breaker',\n  '{{ $json.workflowName.replace(/'/g, \"''\") }}',\n  '{{ $json.executionId.replace(/'/g, \"''\") }}',\n  '{{ $json.failedNode.replace(/'/g, \"''\") }}',\n  'critical',\n  'open',\n  '{{ $json.fingerprint.replace(/'/g, \"''\") }}',\n  '{{ JSON.stringify({ error_count: $json.error_count, category: $json.category, workflowId: $json.workflowId, reason: 'circuit_opened' }).replace(/'/g, \"''\") }}'::jsonb\n)",
+        "options": {}
+      },
+      "id": "pg-log-circuit-breaker-v1l",
+      "name": "Log Circuit Breaker Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2500, 550],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "circuit-suppressing-cond-v1l",
+              "leftValue": "={{ $json.is_circuit_suppressing }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-circuit-suppressing-v1l",
+      "name": "Is Circuit Suppressing?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2250, 850]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst circuitLine = item.is_db_error\n  ? 'Circuit: ⚠️ unknown — Postgres unavailable'\n  : `Circuit: Error ${item.error_count} of 5`;\n\nconst categoryLabel = String(item.category || 'unknown').replace(/_/g, ' ');\nconst burstLine = item.burstSuppressedCount > 0\n  ? `\\n⚡ Suppressed duplicates since previous alert: ${item.burstSuppressedCount}`\n  : '';\n\nconst retryLine = item.retryable\n  ? 'Retryable: yes — auto-retry eligible'\n  : item.retryOf\n    ? 'Retryable: no — this execution is already a retry'\n    : 'Retryable: no';\n\nconst text = `${item.severityIcon} <b>${item.severity.toUpperCase()} — WORKFLOW ERROR</b>\\n\\n<b>Workflow:</b> ${item.workflowName}\\n<b>Failed Node:</b> ${item.failedNode}\\n<b>Category:</b> ${categoryLabel}\\n<b>Error:</b> <code>${item.errorMessage.substring(0, 500)}</code>\\n<b>Execution:</b> ${item.executionUrl}\\n<b>${retryLine}</b>\\n<b>${circuitLine}</b>${burstLine}\\n\\n<b>Trace:</b> <code>${item.traceId}</code>\\n<b>Timestamp:</b> ${new Date().toISOString()}`;\n\nreturn [{ json: { ...item, alertText: text } }];"
+      },
+      "id": "code-fmt-alert-v1l",
+      "name": "Format Alert Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2500, 900]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "={{ $json.alertText }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "tg-send-alert-v1l",
+      "name": "Telegram (Send Alert)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [2750, 900],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, failed_node, severity, status, fingerprint, payload)\nVALUES ($1, 'error_alert', $2, $3, $4, $5, 'sent', $6, $7::jsonb)",
+        "options": {
+          "queryReplacement": "={{ $json.traceId }},{{ $json.workflowName }},{{ $json.executionId }},{{ $json.failedNode }},{{ $json.severity }},{{ $json.fingerprint }},{{ JSON.stringify({ retryable: $json.retryable, retryOf: $json.retryOf, error_count: $json.error_count, category: $json.category, burstSuppressedCount: $json.burstSuppressedCount, dbError: $json.is_db_error }) }}"
+        }
       },
       "id": "pg-log-alert-v1l",
       "name": "Log Alert Event",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [
-        3250,
-        800
-      ],
+      "position": [3000, 900],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "const staticData = $getWorkflowStaticData('global');\nconst item = $input.first().json;\nif (!staticData.eventFailures) staticData.eventFailures = [];\nstaticData.eventFailures.push({\n  timestamp: new Date().toISOString(),\n  traceId: item.traceId || 'unknown',\n  event: 'event_save_failed',\n  error: 'Postgres or Telegram write failed — cached for heartbeat pickup'\n});\nif (staticData.eventFailures.length > 50) {\n  staticData.droppedCacheCount = (staticData.droppedCacheCount || 0) + (staticData.eventFailures.length - 50);\n  staticData.eventFailures = staticData.eventFailures.slice(-50);\n}\nreturn [{ json: { cached: true, count: staticData.eventFailures.length } }];"
+        "jsCode": "const item = $input.first().json;\nconst staticData = $getWorkflowStaticData('global');\n\nconst now = Date.now();\nconst retryKey = 'retry_' + item.fingerprint;\nconst retryMetaKey = retryKey + '_meta';\nconst retryMeta = staticData[retryMetaKey] || { count: 0, firstSeen: now };\n\nif ((now - retryMeta.firstSeen) > 3600000) {\n  retryMeta.count = 0;\n  retryMeta.firstSeen = now;\n}\n\nconst allowedCategory = ['connectivity', 'rate_limit', 'timeout'].includes(item.category);\nconst isRetryExecution = !!item.retryOf;\nconst belowLimit = retryMeta.count < 2;\nconst hasExecutionId = item.executionId && item.executionId !== 'unknown';\n\nconst shouldRetry = !!item.retryable && allowedCategory && !isRetryExecution && belowLimit && hasExecutionId;\n\nif (shouldRetry) {\n  retryMeta.count += 1;\n  retryMeta.lastRetryAt = now;\n  staticData[retryMetaKey] = retryMeta;\n}\n\nfor (const k of Object.keys(staticData)) {\n  if (k.startsWith('retry_') && k.endsWith('_meta')) {\n    const meta = staticData[k];\n    if (meta && meta.firstSeen && (now - meta.firstSeen) > 3600000) delete staticData[k];\n  }\n}\n\nconst baseUrl = $env.N8N_BASE_URL || 'http://localhost:5678';\nconst retryApiUrl = `${baseUrl}/api/v1/executions/${item.executionId}/retry`;\n\nreturn [{\n  json: {\n    ...item,\n    shouldRetry,\n    retryAttempt: retryMeta.count,\n    retryLimit: 2,\n    retryApiUrl,\n    autoRetryReason: shouldRetry\n      ? 'retryable transient failure'\n      : isRetryExecution\n        ? 'execution is already a retry'\n        : !allowedCategory\n          ? 'category not auto-retryable'\n          : !belowLimit\n            ? 'retry limit reached for fingerprint'\n            : !hasExecutionId\n              ? 'missing execution id'\n              : 'not retryable'\n  }\n}];"
+      },
+      "id": "code-should-retry-v1l",
+      "name": "Should Auto-Retry?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3250, 900]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "auto-retry-cond-v1l",
+              "leftValue": "={{ $json.shouldRetry }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-auto-retry-v1l",
+      "name": "Has Auto-Retry?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3500, 900]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.retryApiUrl }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "http-auto-retry-v1l",
+      "name": "HTTP (Auto-Retry Execution)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3750, 800],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nconst item = $input.first().json || {};\nif (!staticData.eventFailures) staticData.eventFailures = [];\nstaticData.eventFailures.push({\n  timestamp: new Date().toISOString(),\n  traceId: item.traceId || 'unknown',\n  eventType: item.eventType || 'alert_failed',\n  source: 'Supervisor Core',\n  workflowName: item.workflowName || 'unknown',\n  failedNode: item.failedNode || 'unknown',\n  reason: item.error?.message || item.db_error_message || 'Postgres, Telegram, or auto-retry delivery failed — cached for heartbeat pickup'\n});\nif (staticData.eventFailures.length > 50) {\n  staticData.droppedCacheCount = (staticData.droppedCacheCount || 0) + (staticData.eventFailures.length - 50);\n  staticData.eventFailures = staticData.eventFailures.slice(-50);\n}\nreturn [{ json: { cached: true, count: staticData.eventFailures.length, droppedCacheCount: staticData.droppedCacheCount || 0 } }];"
       },
       "id": "code-cache-fail-v1l",
       "name": "Cache Event Failure",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [
-        3250,
-        500
-      ]
+      "position": [3750, 550]
     },
     {
       "parameters": {
-        "content": "## 🛡️ Supervisor Core V1 Lean\n**Error Trigger → Normalize → Debounce → Circuit Breaker → Self-Loop Guard → Alert**\n\n- Severity inference: 🔴 critical / 🟡 warning / 🟠 error\n- Credential sanitization before Telegram and DB\n- Circuit escalation: \"Error X of 5\"\n- All failures → Cache Event Failure → Heartbeat pickup\n- Self-loop checks 3 workflow IDs via $env",
-        "width": 400,
-        "height": 180
+        "content": "## 🛡️ Supervisor Core V1 Lean\n**Error Trigger → Enrich/Classify → Self-Loop Guard → Debounce → Circuit → Alert → Auto-Retry**\n\n- Self-loop guard now runs before debounce/circuit\n- Trigger-node error payload fallback included\n- Severity + category inference\n- Credential sanitization before Telegram and DB\n- Circuit transition logging embedded in atomic CTE\n- Circuit alert only fires on newly-open transition\n- Burst duplicate counter included in alerts\n- Auto-retry for transient errors only, guarded by retryOf + fingerprint cooldown\n- All failures → standardized staticData cache",
+        "width": 460,
+        "height": 240
       },
       "id": "sticky-info-v1l",
       "name": "Sticky Note",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [
-        250,
-        300
-      ]
+      "position": [250, 250]
     }
   ],
   "connections": {
@@ -338,29 +368,77 @@
       "main": [
         [
           {
-            "node": "Normalize Error Payload",
+            "node": "Enrich & Classify",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Normalize Error Payload": {
+    "Enrich & Classify": {
       "main": [
         [
           {
-            "node": "Generate Context",
+            "node": "Self-Loop Check",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Generate Context": {
+    "Self-Loop Check": {
       "main": [
+        [
+          {
+            "node": "Is Self Loop?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Self Loop?": {
+      "main": [
+        [
+          {
+            "node": "Telegram (Self-Loop Alert)",
+            "type": "main",
+            "index": 0
+          }
+        ],
         [
           {
             "node": "Is Debounced?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram (Self-Loop Alert)": {
+      "main": [
+        [
+          {
+            "node": "Log Self-Loop Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Cache Event Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Self-Loop Event": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Cache Event Failure",
             "type": "main",
             "index": 0
           }
@@ -419,37 +497,14 @@
       "main": [
         [
           {
-            "node": "Log Circuit Transition",
+            "node": "Is Circuit Newly Open?",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Log Circuit Transition": {
-      "main": [
-        [
-          {
-            "node": "Is Circuit Open?",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Is Circuit Open?",
-            "type": "main",
-            "index": 0
-          },
-          {
-            "node": "Cache Event Failure",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Is Circuit Open?": {
+    "Is Circuit Newly Open?": {
       "main": [
         [
           {
@@ -460,7 +515,7 @@
         ],
         [
           {
-            "node": "Self-Loop Check",
+            "node": "Is Circuit Suppressing?",
             "type": "main",
             "index": 0
           }
@@ -469,6 +524,24 @@
     },
     "Telegram (Circuit Breaker)": {
       "main": [
+        [
+          {
+            "node": "Log Circuit Breaker Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Cache Event Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Circuit Breaker Event": {
+      "main": [
         [],
         [
           {
@@ -479,59 +552,12 @@
         ]
       ]
     },
-    "Self-Loop Check": {
+    "Is Circuit Suppressing?": {
       "main": [
-        [
-          {
-            "node": "Is Self Loop?",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Is Self Loop?": {
-      "main": [
-        [
-          {
-            "node": "Telegram (Self-Loop Alert)",
-            "type": "main",
-            "index": 0
-          }
-        ],
+        [],
         [
           {
             "node": "Format Alert Message",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Telegram (Self-Loop Alert)": {
-      "main": [
-        [
-          {
-            "node": "Log Self-Loop Event",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Cache Event Failure",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Log Self-Loop Event": {
-      "main": [
-        [],
-        [
-          {
-            "node": "Cache Event Failure",
             "type": "main",
             "index": 0
           }
@@ -568,6 +594,47 @@
       ]
     },
     "Log Alert Event": {
+      "main": [
+        [
+          {
+            "node": "Should Auto-Retry?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Cache Event Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Auto-Retry?": {
+      "main": [
+        [
+          {
+            "node": "Has Auto-Retry?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Auto-Retry?": {
+      "main": [
+        [
+          {
+            "node": "HTTP (Auto-Retry Execution)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "HTTP (Auto-Retry Execution)": {
       "main": [
         [],
         [

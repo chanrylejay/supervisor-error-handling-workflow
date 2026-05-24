@@ -1,6 +1,6 @@
 {
   "name": "Data Retention V1 Lean",
-  "description": "12-hour scheduled cleanup with bounded deletes on supervisor_events (90-day retention, LIMIT 1000), stale circuit auto-reset safety valve, ANALYZE pass, and Telegram failure caching for heartbeat pickup.",
+  "description": "12-hour scheduled cleanup with bounded deletes on supervisor_events, stale circuit auto-reset safety valve, table size monitoring, lightweight schema presence check, ANALYZE pass, retention_completed event logging, and Telegram failure caching for heartbeat pickup.",
   "nodes": [
     {
       "parameters": {
@@ -17,112 +17,107 @@
       "name": "Schedule Trigger",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
-      "position": [
-        0,
-        300
-      ]
+      "position": [0, 300]
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH del_events AS (\n  DELETE FROM supervisor_events\n  WHERE id IN (\n    SELECT id FROM supervisor_events\n    WHERE created_at < NOW() - INTERVAL '90 days'\n    LIMIT 1000\n  )\n  RETURNING id\n),\nstale_circuit AS (\n  UPDATE circuit_state\n  SET status = 'closed', error_count = 0, updated_at = NOW()\n  WHERE circuit_key = 'supervisor'\n    AND status = 'open'\n    AND last_error_at < NOW() - INTERVAL '1 hour'\n    AND opened_at < NOW() - INTERVAL '1 hour'\n  RETURNING circuit_key\n)\nSELECT\n  (SELECT COUNT(*) FROM del_events) AS deleted_events_count,\n  (SELECT COUNT(*) > 0 FROM stale_circuit) AS stale_circuit_reset",
-        "options": {}
+        "query": "WITH del_events AS (\n  DELETE FROM supervisor_events\n  WHERE id IN (\n    SELECT id FROM supervisor_events\n    WHERE created_at < NOW() - INTERVAL '90 days'\n    LIMIT 1000\n  )\n  RETURNING id\n),\nstale_circuit AS (\n  UPDATE circuit_state\n  SET status = 'closed', error_count = 0, updated_at = NOW()\n  WHERE circuit_key = 'supervisor'\n    AND status = 'open'\n    AND last_error_at < NOW() - INTERVAL '1 hour'\n    AND opened_at < NOW() - INTERVAL '1 hour'\n  RETURNING circuit_key\n)\nSELECT\n  (SELECT COUNT(*) FROM del_events) AS deleted_events_count,\n  (SELECT COUNT(*) > 0 FROM stale_circuit) AS stale_circuit_reset,\n  (SELECT COUNT(*) FROM supervisor_events) AS total_events,\n  (SELECT pg_size_pretty(pg_total_relation_size('supervisor_events'))) AS events_table_size,\n  (SELECT COUNT(*) FROM schema_versions WHERE version = 'v1_lean') AS schema_version_present,\n  (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('circuit_state', 'supervisor_events', 'schema_versions')) AS expected_tables_found",
+        "options": {
+          "alwaysOutputData": true
+        }
       },
       "id": "pg-cleanup-v1l",
       "name": "Postgres (Cleanup)",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [
-        250,
-        300
-      ],
+      "position": [250, 300],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "const item = $input.first().json;\nconst isDbError = item.error && typeof item.error === 'object' && item.error.message;\n\nif (isDbError) {\n  return [{ json: { report: '🔴 DATA RETENTION — DB ERROR\\n\\nCleanup query failed: ' + item.error.message + '\\n\\nTimestamp: ' + new Date().toISOString(), isDbError: true, isLimitHit: false } }];\n}\n\nconst dev = parseInt(item.deleted_events_count) || 0;\nconst circuitReset = item.stale_circuit_reset === true || item.stale_circuit_reset === 't';\nconst isLimitHit = dev >= 1000;\n\nlet report = `🧹 DATA RETENTION REPORT — V1 Lean\\n\\nDeleted Events (90d): ${dev}`;\n\nif (circuitReset) {\n  report += '\\n\\n⚠️ STALE CIRCUIT RESET: Circuit was open for >1 hour with no new errors. Auto-reset to closed.';\n}\n\nif (isLimitHit) {\n  report += '\\n\\n⚠️ LIMIT HIT — Events table hit the 1000-row deletion cap. Run retention again or increase LIMIT.';\n}\n\nreport += '\\n\\nTimestamp: ' + new Date().toISOString();\n\nreturn [{ json: { report, isDbError: false, isLimitHit } }];"
+        "jsCode": "const item = $input.first().json || {};\nconst isDbError = !!(item.error && typeof item.error === 'object' && item.error.message);\n\nif (isDbError) {\n  return [{\n    json: {\n      report: `🔴 <b>DATA RETENTION — DB ERROR</b>\\n\\nCleanup query failed.\\n\\n<b>Error:</b> <code>${String(item.error.message).substring(0, 500)}</code>\\n<b>Timestamp:</b> ${new Date().toISOString()}`,\n      isDbError: true,\n      isLimitHit: false,\n      deletedEvents: 0,\n      totalEvents: 0,\n      eventsTableSize: 'unknown',\n      staleCircuitReset: false,\n      schemaVersionPresent: false,\n      expectedTablesFound: 0,\n      schemaOk: false\n    }\n  }];\n}\n\nconst deletedEvents = parseInt(item.deleted_events_count, 10) || 0;\nconst staleCircuitReset = item.stale_circuit_reset === true || item.stale_circuit_reset === 't';\nconst isLimitHit = deletedEvents >= 1000;\nconst totalEvents = parseInt(item.total_events, 10) || 0;\nconst eventsTableSize = item.events_table_size || 'unknown';\nconst schemaVersionPresent = (parseInt(item.schema_version_present, 10) || 0) > 0;\nconst expectedTablesFound = parseInt(item.expected_tables_found, 10) || 0;\nconst schemaOk = schemaVersionPresent && expectedTablesFound === 3;\n\nlet report = `🧹 <b>DATA RETENTION REPORT — V1 Lean</b>\\n\\n<b>Deleted Events older than 90d:</b> ${deletedEvents}\\n<b>Remaining Events:</b> ${totalEvents}\\n<b>Events Table Size:</b> ${eventsTableSize}\\n<b>Schema:</b> ${schemaOk ? '✅ v1_lean present, 3/3 tables found' : `⚠️ check needed — version present: ${schemaVersionPresent ? 'yes' : 'no'}, tables found: ${expectedTablesFound}/3`}`;\n\nif (staleCircuitReset) {\n  report += '\\n\\n⚠️ <b>STALE CIRCUIT RESET:</b> Circuit was open for >1 hour with no new errors. Auto-reset to closed.';\n}\n\nif (isLimitHit) {\n  report += '\\n\\n⚠️ <b>LIMIT HIT:</b> Events table hit the 1000-row deletion cap. Run retention again or increase LIMIT if backlog persists.';\n}\n\nreport += `\\n\\n<b>Timestamp:</b> ${new Date().toISOString()}`;\n\nreturn [{\n  json: {\n    report,\n    isDbError: false,\n    isLimitHit,\n    deletedEvents,\n    totalEvents,\n    eventsTableSize,\n    staleCircuitReset,\n    schemaVersionPresent,\n    expectedTablesFound,\n    schemaOk\n  }\n}];"
       },
       "id": "code-eval-cleanup-v1l",
       "name": "Evaluate Cleanup",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [
-        500,
-        300
-      ]
+      "position": [500, 300]
     },
     {
       "parameters": {
         "operation": "executeQuery",
         "query": "ANALYZE supervisor_events;\nANALYZE circuit_state;",
-        "options": {}
+        "options": {
+          "alwaysOutputData": true
+        }
       },
       "id": "pg-analyze-v1l",
       "name": "Postgres (Analyze)",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [
-        750,
-        300
-      ],
+      "position": [750, 300],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "const item = $input.first().json;\nconst evalReport = $('Evaluate Cleanup').first().json.report;\nconst analyzeError = item.error && typeof item.error === 'object' && item.error.message;\nlet report = evalReport;\nif (analyzeError) report += '\\n\\n⚠️ ANALYZE FAILED: ' + item.error.message;\nelse report += '\\n\\n✅ ANALYZE completed successfully.';\nreturn [{ json: { report } }];"
+        "jsCode": "const item = $input.first().json || {};\nconst evalData = $('Evaluate Cleanup').first().json || {};\nlet report = evalData.report || '🧹 <b>DATA RETENTION REPORT</b>\\n\\nNo cleanup report was generated.';\nconst analyzeError = !!(item.error && typeof item.error === 'object' && item.error.message);\n\nif (analyzeError) {\n  report += `\\n\\n⚠️ <b>ANALYZE FAILED:</b> <code>${String(item.error.message).substring(0, 500)}</code>`;\n} else {\n  report += '\\n\\n✅ <b>ANALYZE:</b> completed successfully.';\n}\n\nreturn [{\n  json: {\n    ...evalData,\n    report,\n    analyzeOk: !analyzeError,\n    analyzeErrorMessage: analyzeError ? item.error.message : ''\n  }\n}];"
       },
       "id": "code-check-analyze-v1l",
       "name": "Check Analyze Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [
-        1000,
-        300
-      ]
+      "position": [1000, 300]
     },
     {
       "parameters": {
-        "chatId": "REPLACE_WITH_TELEGRAM_CHAT_ID",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
         "text": "={{ $json.report }}",
-        "additionalFields": {}
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
       },
       "id": "tg-retention-report-v1l",
       "name": "Telegram (Retention Report)",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.1,
-      "position": [
-        1250,
-        300
-      ],
+      "position": [1250, 300],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "const staticData = $getWorkflowStaticData('global');\nif (!staticData.eventFailures) staticData.eventFailures = [];\nstaticData.eventFailures.push({\n  timestamp: new Date().toISOString(),\n  event: 'retention_telegram_alert_failed',\n  source: 'Data Retention',\n  error: 'Telegram delivery failed'\n});\nif (staticData.eventFailures.length > 50) {\n  staticData.droppedCacheCount = (staticData.droppedCacheCount || 0) + (staticData.eventFailures.length - 50);\n  staticData.eventFailures = staticData.eventFailures.slice(-50);\n}\nreturn [{ json: { cached: true } }];"
+        "operation": "executeQuery",
+        "query": "=INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, severity, status, payload)\nVALUES (\n  'retention-' || EXTRACT(EPOCH FROM NOW())::INTEGER,\n  'retention_completed',\n  'Data Retention',\n  'retention',\n  '{{ ($json.isDbError || !$json.analyzeOk || !$json.schemaOk || $json.isLimitHit) ? \"warning\" : \"info\" }}',\n  '{{ ($json.isDbError || !$json.analyzeOk || !$json.schemaOk || $json.isLimitHit) ? \"completed_with_warnings\" : \"completed\" }}',\n  '{{ JSON.stringify({ deleted_events: $json.deletedEvents, total_events: $json.totalEvents, events_table_size: $json.eventsTableSize, stale_circuit_reset: $json.staleCircuitReset, limit_hit: $json.isLimitHit, schema_ok: $json.schemaOk, schema_version_present: $json.schemaVersionPresent, expected_tables_found: $json.expectedTablesFound, analyze_ok: $json.analyzeOk }).replace(/'/g, \"''\") }}'::jsonb\n)",
+        "options": {}
+      },
+      "id": "pg-log-retention-v1l",
+      "name": "Log Retention Completed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1500, 300],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nconst item = $input.first().json || {};\nif (!staticData.eventFailures) staticData.eventFailures = [];\nstaticData.eventFailures.push({\n  timestamp: new Date().toISOString(),\n  traceId: item.traceId || 'unknown',\n  eventType: item.eventType || 'alert_failed',\n  source: 'Data Retention',\n  workflowName: 'Data Retention',\n  failedNode: item.failedNode || 'unknown',\n  reason: item.error?.message || 'Telegram or Postgres delivery failed'\n});\nif (staticData.eventFailures.length > 50) {\n  staticData.droppedCacheCount = (staticData.droppedCacheCount || 0) + (staticData.eventFailures.length - 50);\n  staticData.eventFailures = staticData.eventFailures.slice(-50);\n}\nreturn [{ json: { cached: true, count: staticData.eventFailures.length, droppedCacheCount: staticData.droppedCacheCount || 0 } }];"
       },
       "id": "code-cache-ret-fail-v1l",
       "name": "Cache Retention Alert Failure",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [
-        1500,
-        400
-      ]
+      "position": [1750, 450]
     },
     {
       "parameters": {
-        "content": "## 🧹 Data Retention V1 Lean\n**Every 12 hours: Cleanup → Analyze → Report**\n\n- Deletes supervisor_events older than 90 days (LIMIT 1000)\n- Auto-resets stale open circuits (>1 hour safety valve)\n- ANALYZE for query planner freshness\n- Telegram report with limit-hit warning",
-        "width": 400,
-        "height": 160
+        "content": "## 🧹 Data Retention V1 Lean\n**Every 12 hours: Cleanup → Analyze → Report → Log retention_completed**\n\n- Deletes supervisor_events older than 90 days, LIMIT 1000\n- Auto-resets stale open circuits >1 hour\n- Adds table size + total event count to report\n- Lightweight schema check: v1_lean version + 3 expected tables\n- ANALYZE for query planner freshness\n- Logs retention_completed only after Telegram report succeeds\n- Standardized failure cache payload",
+        "width": 460,
+        "height": 220
       },
       "id": "sticky-ret-v1l",
       "name": "Sticky Note",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [
-        0,
-        100
-      ]
+      "position": [0, 50]
     }
   ],
   "connections": {
@@ -196,6 +191,24 @@
       ]
     },
     "Telegram (Retention Report)": {
+      "main": [
+        [
+          {
+            "node": "Log Retention Completed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Cache Retention Alert Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Retention Completed": {
       "main": [
         [],
         [
