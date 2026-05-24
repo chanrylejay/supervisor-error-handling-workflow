@@ -1,15 +1,16 @@
 # Supervisor V1 Lean — Deployment Guide
 
-**Project:** Supervisor V1 Lean
-**Author:** Chan (Chanryle Jay Cagara)
-**Last Updated:** 2026-05-24
-**n8n Version:** 2.12.3 (self-hosted, Windows/PowerShell)
+**Project:** Supervisor V1 Lean (Final Build)  
+**Author:** Chan (Chanryle Jay Cagara)  
+**Last Updated:** 2026-05-25  
+**n8n Version:** 2.12.3 (self-hosted, Windows/PowerShell)  
+**Audit History:** 10 review cycles, 114 approved changes, 2 AI agents
 
 ---
 
 ## Overview
 
-This guide covers everything needed to deploy Supervisor V1 Lean from scratch. It incorporates all 10 deployment lessons learned from the V23 deployment so you don't repeat them.
+This guide covers everything needed to deploy Supervisor V1 Lean from scratch. It incorporates deployment lessons from V23 and all findings from 10 audit rounds.
 
 **Estimated time:** 30–45 minutes for first deployment.
 
@@ -20,13 +21,13 @@ This guide covers everything needed to deploy Supervisor V1 Lean from scratch. I
 Before starting, ensure you have:
 
 - [ ] **n8n** self-hosted and running on `http://localhost:5678`
-- [ ] **Neon PostgreSQL** account — [neon.tech](https://neon.tech) (free tier)
+- [ ] **Neon** account (https://neon.tech) with free tier
   - Region: Singapore (aws-ap-southeast-1) recommended for Philippines
   - Use the **pooled** endpoint (not direct)
-- [ ] **Telegram Bot** — created via [@BotFather](https://t.me/BotFather)
+- [ ] **Telegram Bot** (https://t.me/BotFather)
   - Bot token saved
-  - Your chat ID known (use [@userinfobot](https://t.me/userinfobot) to get it)
-- [ ] **Healthchecks.io** account — [healthchecks.io](https://healthchecks.io) (free tier)
+  - Your chat ID known (use https://t.me/userinfobot to get it)
+- [ ] **Healthchecks.io** account (https://healthchecks.io) with free tier
   - Create a check with **Period: 5 minutes** and **Grace: 30 minutes**
   - Copy the ping URL
 
@@ -36,7 +37,7 @@ Before starting, ensure you have:
 
 ### Option A: Fresh Install
 
-If this is a new database (no V23 tables), simply run the schema file:
+Run `database/schema.sql` against your Postgres instance:
 
 **Via Neon SQL Editor:**
 1. Open your Neon project dashboard
@@ -51,13 +52,10 @@ psql "postgresql://user:pass@your-neon-host/dbname?sslmode=require" -f database/
 
 ### Option B: Existing V23 Database
 
-If you're deploying on the same Neon database that has V23 tables, **just run the schema.sql as-is**. All `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` statements are idempotent.
-
-The V23 tables (`error_logs`, `alert_log`, `pending_approvals`, `dead_letter_queue`) will remain but are never touched by V1 Lean. They're harmless.
+Just run schema.sql as-is. All statements are idempotent (CREATE IF NOT EXISTS). V23 tables remain but are never touched.
 
 **Optional cleanup** (only after V1 Lean is confirmed stable):
 ```sql
--- Remove V23-only tables
 DROP TABLE IF EXISTS error_logs CASCADE;
 DROP TABLE IF EXISTS alert_log CASCADE;
 DROP TABLE IF EXISTS pending_approvals CASCADE;
@@ -66,11 +64,15 @@ DROP TABLE IF EXISTS dead_letter_queue CASCADE;
 
 ### Verification
 
-After running the schema, verify:
+Run these queries to verify deployment:
 
 ```sql
 -- Should return 1 row: status='closed', error_count=0
 SELECT * FROM circuit_state;
+
+-- Should contain: date_trunc('hour'::text, created_at)
+SELECT indexdef FROM pg_indexes
+WHERE indexname = 'idx_events_orphan_dedup';
 
 -- Should return 1 row: version='v1_lean'
 SELECT * FROM schema_versions;
@@ -78,7 +80,7 @@ SELECT * FROM schema_versions;
 -- Should return 0
 SELECT COUNT(*) FROM supervisor_events;
 
--- Should return 6 indexes
+-- Should return 7 indexes (6 custom + 1 PK)
 SELECT indexname FROM pg_indexes
 WHERE tablename = 'supervisor_events'
 ORDER BY indexname;
@@ -88,42 +90,43 @@ ORDER BY indexname;
 
 ## 3. Environment Variables
 
-### Why These Matter
-
-n8n 2.12.3 blocks `crypto` module and `$env` access by default. Without these variables, the Heartbeat's MD5 hash and the Self-Loop Check's `$env` lookups will fail silently.
-
 ### Variable Reference
 
 | Variable | Required | Purpose |
-|---|---|---|
-| `NODE_FUNCTION_ALLOW_BUILTIN` | Yes | Enables `require('crypto')` in Code nodes |
-| `N8N_BLOCK_ENV_ACCESS_IN_NODE` | Yes | Enables `$env.VARIABLE` in Code nodes |
-| `HEALTHCHECKS_PING_URL` | Yes | Dead Man's Switch ping URL |
-| `SUPERVISOR_WORKFLOW_ID` | Yes | Self-loop guard + orphan exclusion |
-| `HEARTBEAT_WORKFLOW_ID` | Yes | Self-loop guard + orphan exclusion |
-| `RETENTION_WORKFLOW_ID` | Yes | Self-loop guard + orphan exclusion |
-| `N8N_CONCURRENCY_PRODUCTION_LIMIT` | Optional | Limits concurrent workflow executions (default: 3) |
+|----------|----------|---------|
+| NODE_FUNCTION_ALLOW_BUILTIN | Yes | Enables require('crypto') in Code nodes |
+| N8N_BLOCK_ENV_ACCESS_IN_NODE | Yes | Enables $env.VARIABLE in Code nodes |
+| HEALTHCHECKS_PING_URL | Yes | Dead Man's Switch ping URL |
+| SUPERVISOR_WORKFLOW_ID | Yes | Self-loop guard + orphan exclusion |
+| HEARTBEAT_WORKFLOW_ID | Yes | Self-loop guard + orphan exclusion |
+| RETENTION_WORKFLOW_ID | Yes | Self-loop guard + orphan exclusion |
+| TELEGRAM_CHAT_ID | Yes | All Telegram alerts |
+| CRITICAL_WORKFLOW_IDS | Yes | Activation monitoring (comma-separated) |
+| LONG_RUNNING_WORKFLOW_IDS | Optional | Orphan detection exclusion (comma-separated) |
+| NEVER_RETRY_WORKFLOW_IDS | Optional | Auto-retry safety denylist (comma-separated) |
+| N8N_CONCURRENCY_PRODUCTION_LIMIT | Optional | Limits concurrent executions (default: 3) |
 
-### Setting Variables (Interactive Session)
+### Setting Variables
 
+**PowerShell:**
 ```powershell
 $env:NODE_FUNCTION_ALLOW_BUILTIN = "crypto"
 $env:N8N_BLOCK_ENV_ACCESS_IN_NODE = "false"
 $env:HEALTHCHECKS_PING_URL = "https://hc-ping.com/your-uuid-here"
+$env:TELEGRAM_CHAT_ID = "your-chat-id"
+$env:CRITICAL_WORKFLOW_IDS = "id1,id2,id3"
 $env:SUPERVISOR_WORKFLOW_ID = "FILL_AFTER_IMPORT"
 $env:HEARTBEAT_WORKFLOW_ID = "FILL_AFTER_IMPORT"
 $env:RETENTION_WORKFLOW_ID = "FILL_AFTER_IMPORT"
-$env:N8N_CONCURRENCY_PRODUCTION_LIMIT = "3"
+
 npx n8n
 ```
 
-> **IMPORTANT:** Use PowerShell `$env:VAR = "value"` syntax. NOT Bash `export VAR=value`. This project runs on Windows.
+> **IMPORTANT:** Use PowerShell `$env:VAR = "value"` syntax. NOT Bash `export`.
 
-> **NOTE:** Workflow IDs are only known after importing. See Section 5 for when to fill them in.
+> **NOTE:** Workflow IDs are only known after importing. See Section 5.
 
 ### PowerShell Execution Policy
-
-If your startup script won't run, set the execution policy:
 
 ```powershell
 Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass
@@ -133,43 +136,33 @@ Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass
 
 ## 4. n8n Credential Setup
 
-Set up these credentials in n8n before importing workflows.
-
 ### Postgres Credential
 
 | Setting | Value |
-|---|---|
-| Host | Your Neon pooled endpoint (e.g. `ep-xxx.ap-southeast-1.aws.neon.tech`) |
-| Port | `5432` |
+|---------|-------|
+| Host | Your Neon pooled endpoint |
+| Port | 5432 |
 | Database | Your database name |
 | User | Your Neon username |
 | Password | Your Neon password |
-| SSL | `Allow` |
-| Max Connections | `5` |
+| SSL | Allow |
 
-> **Neon gotcha:** Neon serverless Postgres can take 1–3 seconds to wake from idle. If you see connection timeouts on the first query after idle, add `connectionTimeout: 10` to the Postgres credential's "Connection Options" field.
+> **Neon gotcha:** Add `connectionTimeout: 10` in Connection Options for cold-start tolerance.
 
 ### Telegram Bot Credential
 
 | Setting | Value |
-|---|---|
+|---------|-------|
 | Access Token | Your bot token from BotFather |
-
-> **Tip:** Use the same Telegram bot you use for Shiny Gmail. One bot can serve multiple workflows.
 
 ### HTTP Header Auth Credential
 
-This is used by the Heartbeat Monitor's orphan detection to query the n8n REST API.
+Used by Heartbeat's orphan detection and activation monitoring to query the n8n API.
 
 | Setting | Value |
-|---|---|
-| Name | `X-N8N-API-KEY` |
-| Value | Your n8n API key |
-
-To create an n8n API key:
-1. Go to `http://localhost:5678/settings/api`
-2. Click **Create API Key**
-3. Copy the key
+|---------|-------|
+| Name | X-N8N-API-KEY |
+| Value | Your n8n API key (create at localhost:5678/settings/api) |
 
 ---
 
@@ -177,81 +170,51 @@ To create an n8n API key:
 
 ### Import Order
 
-Import in this exact order:
-
-```
-1. workflows/workflow_1_supervisor_core.json
-2. workflows/workflow_2_heartbeat_monitor.json
-3. workflows/workflow_3_data_retention.json
-```
+1. `workflows/workflow_1_supervisor_core.json`
+2. `workflows/workflow_2_heartbeat_monitor.json`
+3. `workflows/workflow_3_data_retention.json`
 
 ### After Import: Note Workflow IDs
 
-After importing each workflow, note its ID from the URL bar:
-
 ```
-http://localhost:5678/workflow/AbCdE123  ← "AbCdE123" is the workflow ID
+http://localhost:5678/workflow/AbCdE123  ← "AbCdE123" is the ID
 ```
 
-Record all three:
-
-```
-Supervisor Core:    _______________
-Heartbeat Monitor:  _______________
-Data Retention:     _______________
-```
-
-### Update Startup Script
-
-Go back and fill in the workflow IDs in your startup script or environment variables:
+Record all three and update your startup script:
 
 ```powershell
-$env:SUPERVISOR_WORKFLOW_ID = "AbCdE123"   # ← your actual ID
-$env:HEARTBEAT_WORKFLOW_ID = "FgHiJ456"    # ← your actual ID
-$env:RETENTION_WORKFLOW_ID = "KlMnO789"    # ← your actual ID
+$env:SUPERVISOR_WORKFLOW_ID = "AbCdE123"
+$env:HEARTBEAT_WORKFLOW_ID = "FgHiJ456"
+$env:RETENTION_WORKFLOW_ID = "KlMnO789"
 ```
 
-> **IMPORTANT:** If n8n is already running, you must restart it for new `$env` values to take effect.
-
-### Replace Telegram Chat IDs
-
-Search for `REPLACE_WITH_TELEGRAM_CHAT_ID` in all workflows and replace with your actual Telegram chat ID.
-
-| Workflow | Telegram Nodes to Update | Count |
-|---|---|---|
-| Supervisor Core | Telegram (Circuit Breaker), Telegram (Self-Loop Alert), Telegram (Send Alert) | 3 |
-| Heartbeat Monitor | Telegram (DMS Failure), Telegram (Heartbeat), Telegram (API Error), Telegram (Orphan Alert) | 4 |
-| Data Retention | Telegram (Retention Report) | 1 |
-| **Total** | | **8 nodes** |
+Restart n8n after updating env vars.
 
 ### Assign Credentials
 
-After import, open each workflow and assign the correct credentials to:
-- All **Postgres** nodes → your Neon credential
-- All **Telegram** nodes → your Telegram Bot credential
-- **HTTP (Running Executions)** in Heartbeat → your HTTP Header Auth credential
+Open each workflow and assign:
+
+- All Postgres nodes → your Neon credential
+- All Telegram nodes → your Telegram Bot credential
+- All HTTP Request nodes with auth → your HTTP Header Auth credential
 
 ### ⚠️ CRITICAL: Import Corruption Warning
 
-n8n can corrupt IF and Switch node output mappings during JSON import. Wires may look correct visually but route data to wrong outputs during execution.
+n8n can corrupt IF node output mappings during JSON import. Wires may look correct but route wrong.
 
-**Symptoms:**
-- IF node always takes the wrong branch
-- Errors don't reach the Telegram alert despite wiring looking correct
-- "All paths working except one specific branch"
+**Symptoms:** IF node always takes the wrong branch.
 
-**Fix:** Delete the corrupted node entirely, add a new one, and recreate the conditions and connections from scratch.
+**Fix:** Delete the corrupted IF node, add a new one, recreate conditions and connections.
 
-**Which nodes to watch:**
-- `Is Debounced?` (Workflow 1)
-- `Is Circuit Open?` (Workflow 1)
-- `Is Self Loop?` (Workflow 1)
-- `Has DMS Failed?` (Workflow 2)
-- `Should Send?` (Workflow 2)
-- `Has API Error?` (Workflow 2)
-- `Has Orphans?` (Workflow 2)
+**Watch these nodes:**
 
-> **Tip from V23 deployment:** 6 out of 8 branching nodes were corrupted during V23's import. Test each branch explicitly during smoke testing.
+- Is Self Loop? (WF1)
+- Is Debounced? (WF1)
+- Should Alert Orphans? (WF2)
+- Has Recovery Transition? (WF2)
+- Has Activation Issue? (WF2)
+- Should Send? (WF2)
+- Should Notify? (WF3)
 
 ---
 
@@ -259,232 +222,94 @@ n8n can corrupt IF and Switch node output mappings during JSON import. Wires may
 
 ### Activation Order
 
-Activate in this order:
+1. Data Retention V1 Lean (background cleanup)
+2. Heartbeat Monitor V1 Lean (health monitoring)
+3. Supervisor Core V1 Lean (error catching)
+
+Within 5 minutes, you should receive your first heartbeat:
 
 ```
-1. Data Retention V1 Lean        (background cleanup - safe to start first)
-2. Heartbeat Monitor V1 Lean     (start health monitoring)
-3. Supervisor Core V1 Lean       (start catching errors)
+💓 SUPERVISOR — 🟢 HEALTHY
+
+🟢 Circuit: closed (0/5)
+🟢 DMS: ok
+...
 ```
-
-**Why this order:** Retention and Heartbeat should be running before Supervisor starts catching errors. This ensures the circuit reset probe and health monitoring are active from the moment the first error is caught.
-
-### After Activating Heartbeat
-
-Within 5 minutes of activating the Heartbeat Monitor, you should receive your first Telegram heartbeat message:
-
-```
-💓 HEARTBEAT — Supervisor V1 Lean
-
-Circuit: 🟢 closed (0 errors)
-Errors (1h): 0
-Errors (24h): 0
-Trend: 🟢 stable
-
-Timestamp: 2026-05-24T06:00:00Z
-```
-
-If you don't receive it within 5 minutes, check:
-1. Telegram bot token and chat ID are correct
-2. The workflow is activated (green toggle ON)
-3. Postgres credential is connected
 
 ---
 
 ## 7. Setting Error Workflows
 
-For every workflow you want Supervisor to monitor, configure it as the error handler:
+For every monitored workflow: **Settings → Error Workflow → Supervisor Core V1 Lean**
 
-1. Open the monitored workflow
-2. Go to **Settings** (gear icon, top right)
-3. Set **Error Workflow** → **Supervisor Core V1 Lean**
-4. Save
-
-### Shiny Gmail Workflows
-
-If you're running Shiny Gmail Automation, set Supervisor as the error workflow for:
-
-- [ ] Shiny Gmail Daily Orchestrator V2.7 Lean
-- [ ] Shiny Gmail Single Email Processor Child V2.7 Lean
-- [ ] Shiny Gmail Lightweight Telegram Rules Manager V2.7 Lean
-
-### Important: Production Runs Only
-
-> **Error Trigger only fires on PRODUCTION (published/active) runs, NOT manual test executions.**
->
-> If you click "Execute Workflow" to test, errors will NOT reach Supervisor. The monitored workflow must be **activated** and triggered by its schedule/trigger to generate real Error Trigger events.
+> **Note:** Error Trigger only fires on PRODUCTION runs, NOT manual test executions. The monitored workflow must be activated.
 
 ---
 
 ## 8. Smoke Tests
 
-Run these tests in order. Each builds on the previous.
-
 ### Test 1: Heartbeat ✅
 
-**What:** Verify Heartbeat Monitor is running and sending status.
-
-**Steps:**
-1. Activate Heartbeat Monitor
-2. Wait up to 5 minutes
-3. Check Telegram for heartbeat message
-
-**Expected:** Heartbeat message with circuit status, error counts, and trend.
+Activate Heartbeat Monitor. Wait 5 minutes. Check Telegram.
 
 ### Test 2: Dead Man's Switch ✅
 
-**What:** Verify Healthchecks.io is receiving pings.
+Check Healthchecks.io dashboard — should show UP with recent ping.
 
-**Steps:**
-1. Go to your Healthchecks.io dashboard
-2. Check that the Supervisor check shows **UP**
-3. Last ping should be within the last 5 minutes
+### Test 3: Database ✅
 
-**Expected:** Green status, recent ping timestamp.
-
-### Test 3: Database Verification ✅
-
-**What:** Confirm schema deployed correctly.
-
-**Steps:**
 ```sql
 SELECT * FROM circuit_state;
--- Expected: 1 row, status='closed', error_count=0
-
 SELECT * FROM schema_versions;
--- Expected: version='v1_lean'
-
 SELECT COUNT(*) FROM supervisor_events;
--- Expected: 0 or small number (heartbeat events may have started)
 ```
 
 ### Test 4: Error Alert ✅
 
-**What:** Trigger a real error and verify Supervisor sends an alert.
-
-**Steps:**
-1. Create a new workflow called "Test Error Generator"
-2. Add a **Schedule Trigger** (set to every 1 minute for testing)
-3. Add a **Code** node with:
-   ```javascript
-   throw new Error('Supervisor V1 Lean smoke test — this is a test error');
-   ```
-4. Go to **Settings → Error Workflow → Supervisor Core V1 Lean**
-5. **Activate** the Test Error Generator workflow
-6. Wait for the schedule to fire (up to 1 minute)
-7. Check Telegram for the alert
-
-**Expected:**
-```
-🟠 ERROR — WORKFLOW ERROR
-
-Workflow: Test Error Generator
-Failed Node: Code
-Error: Supervisor V1 Lean smoke test — this is a test error
-Execution: http://localhost:5678/executions/xxxxx
-Retryable: yes
-Circuit: Error 1 of 5
-
-Trace: err-xxxxx-xxxxxxxxx
-Timestamp: 2026-05-24Txx:xx:xxZ
-```
-
-**After test:** Deactivate the Test Error Generator workflow.
+Create test workflow with `throw new Error('Supervisor smoke test')`. Set Error Workflow to Supervisor Core. Activate and trigger. Check Telegram for alert with probable cause advice.
 
 ### Test 5: Debounce ✅
 
-**What:** Verify duplicate errors within 30 seconds are suppressed.
+Trigger the test workflow twice within 30 seconds. Only one alert should arrive.
 
-**Steps:**
-1. Reactivate Test Error Generator
-2. Set schedule to every 5 seconds (or trigger manually twice rapidly)
-3. Wait for 2 triggers within 30 seconds
-4. Check Telegram
-
-**Expected:** Only ONE alert received, not two. Second error is debounced.
-
-**Verify in database:**
 ```sql
-SELECT event_type, COUNT(*)
-FROM supervisor_events
+SELECT event_type, COUNT(*) FROM supervisor_events
 WHERE created_at > NOW() - INTERVAL '5 minutes'
 GROUP BY event_type;
 -- Should show: error_alert (1), error_debounced (1+)
 ```
 
-**After test:** Deactivate the Test Error Generator.
-
 ### Test 6: Circuit Breaker ✅
 
-**What:** Verify circuit opens after 5 errors.
-
-**Steps:**
-1. Set Test Error Generator schedule to every 1 minute
-2. Activate and let it fire 5+ times (spaced >30s apart to avoid debounce)
-3. Watch Telegram
-
-**Expected:**
-- Alerts for errors 1–4 with escalating "Error X of 5"
-- At error 5: Circuit Breaker Open alert
-- Error 6+: No alerts (circuit is open, errors suppressed)
+Let test workflow fire 5+ times (spaced >30s apart). Watch for escalating "Error X of 5" alerts, then circuit-open banner on the 5th error.
 
 **After test:**
-1. Deactivate Test Error Generator
-2. Reset the circuit:
 ```sql
-UPDATE circuit_state
-SET status = 'closed', error_count = 0, updated_at = NOW()
+UPDATE circuit_state SET status = 'closed', error_count = 0, updated_at = NOW()
 WHERE circuit_key = 'supervisor';
 ```
 
 ### Test 7: Self-Loop Detection ✅
 
-**What:** Verify Supervisor detects errors from its own workflows.
-
-**Steps:**
-1. Temporarily set Supervisor Core's own Error Workflow to itself
-2. Add a Code node to Supervisor Core that throws an error (or wait for a natural error)
-3. Check Telegram
-
-**Expected:** Self-loop detection alert instead of a normal error alert.
-
-**After test:** Remove the self-referencing Error Workflow setting. Supervisor should NOT monitor itself in production (the self-loop guard is a safety net, not the primary design).
+Temporarily set Supervisor Core's Error Workflow to itself. Trigger an error. Check for self-loop alert with execution URL.
 
 ### Test 8: Data Retention ✅
 
-**What:** Verify retention runs and reports.
-
-**Steps:**
-- Either wait 12 hours for the scheduled run, OR
-- Manually execute the Data Retention workflow (click "Execute Workflow")
-
-**Expected:**
-```
-🧹 DATA RETENTION REPORT — V1 Lean
-
-Deleted Events (90d): 0
-
-✅ ANALYZE completed successfully.
-
-Timestamp: 2026-05-24Txx:xx:xxZ
-```
-
-### Post-Testing Cleanup
-
-After all tests pass:
+Manually execute Data Retention. Check Telegram for retention report (or verify `retention_completed` event in database if report was suppressed as routine).
 
 ```sql
--- Reset circuit breaker if needed
-UPDATE circuit_state
-SET status = 'closed', error_count = 0, updated_at = NOW()
-WHERE circuit_key = 'supervisor';
-
--- Optional: clear test events
-DELETE FROM supervisor_events
-WHERE workflow_name = 'Test Error Generator';
+SELECT * FROM supervisor_events WHERE event_type = 'retention_completed'
+ORDER BY created_at DESC LIMIT 1;
 ```
 
-Deactivate or delete the Test Error Generator workflow.
+### Post-Test Cleanup
+
+```sql
+UPDATE circuit_state SET status = 'closed', error_count = 0, updated_at = NOW()
+WHERE circuit_key = 'supervisor';
+```
+
+Deactivate or delete the test workflow.
 
 ---
 
@@ -493,226 +318,188 @@ Deactivate or delete the Test Error Generator workflow.
 ### "No Telegram alert received"
 
 | Check | How |
-|---|---|
+|-------|-----|
 | Bot token correct? | Send a test message via BotFather |
-| Chat ID correct? | Use [@userinfobot](https://t.me/userinfobot) to verify |
+| Chat ID correct? | Use https://t.me/userinfobot |
 | Workflow active? | Green toggle must be ON |
 | Error Workflow set? | Monitored workflow → Settings → Error Workflow |
-| Production run? | Error Trigger only fires on active/published runs, NOT manual executions |
-| Credentials assigned? | Open workflow, check each Telegram node has a credential |
+| Production run? | Manual executions don't trigger Error Trigger |
+| Credentials assigned? | Check each Telegram node has a credential |
 
 ### "Heartbeat not sending"
 
-The heartbeat uses MD5 dedup — **identical state = message suppressed**. This is by design ("no news = good news").
+Heartbeat uses MD5 dedup. Identical state = suppressed. A heartbeat sends when:
 
-A heartbeat will send when:
-- System state **changes** (circuit status, error counts, cache contents)
-- Database is **unreachable** (always sends on DB error)
-- First message of the **hour** (healthy heartbeat sent when minutes < 5)
+- State changes (circuit, errors, orphans, DMS, activation)
+- Database is unreachable
+- Recovery from DEGRADED/CRITICAL to HEALTHY
+- First message of the hour (healthy pulse)
 
-If you need to force a heartbeat, change the circuit state temporarily:
+**Force a heartbeat:**
 ```sql
 UPDATE circuit_state SET error_count = 1 WHERE circuit_key = 'supervisor';
--- Wait for next heartbeat cycle (up to 5 min)
--- Then reset:
+-- Wait up to 5 min, then reset:
 UPDATE circuit_state SET error_count = 0 WHERE circuit_key = 'supervisor';
 ```
 
 ### "Circuit stuck open"
 
-Manual reset:
 ```sql
-UPDATE circuit_state
-SET status = 'closed', error_count = 0, updated_at = NOW()
+UPDATE circuit_state SET status = 'closed', error_count = 0, updated_at = NOW()
 WHERE circuit_key = 'supervisor';
 ```
 
-Note: The Heartbeat Monitor automatically recovers open circuits after 5 minutes, and Data Retention resets stale circuits after 1 hour. If the circuit stays open, check that both workflows are active.
+The Heartbeat auto-recovers after 5 min, and Retention resets after 1 hour. If stuck, check both are active.
 
-### "Orphan detection not working"
+### "Events not being logged"
 
-- Check the **HTTP Header Auth** credential is assigned to the `HTTP (Running Executions)` node
-- Verify your n8n API key works: open `http://localhost:5678/api/v1/workflows` in your browser with the API key header
-- The API must be accessible from localhost
+If `supervisor_events` is empty despite Telegram alerts arriving, check for the queryReplacement comma-split bug. All INSERT nodes should use the single-JSON-parameter pattern (`$1::jsonb`).
+
+**Verify:**
+```sql
+SELECT event_type, COUNT(*) FROM supervisor_events GROUP BY event_type ORDER BY count DESC;
+```
 
 ### "$env not accessible" or "crypto is not defined"
-
-These mean the environment variables are not set:
 
 ```powershell
 $env:NODE_FUNCTION_ALLOW_BUILTIN = "crypto"
 $env:N8N_BLOCK_ENV_ACCESS_IN_NODE = "false"
 ```
 
-You must restart n8n after setting these. They cannot be added while n8n is running.
-
-### "Postgres connection timeout"
-
-Neon serverless Postgres can take 1–3 seconds to wake from idle. Solutions:
-1. Add `connectionTimeout: 10` in the Postgres credential's Connection Options
-2. The `alwaysOutputData: true` setting on critical Postgres nodes prevents execution chain breaks on empty/error results
+Restart n8n after setting these.
 
 ### "IF node routes everything to wrong branch"
 
-This is a confirmed n8n import corruption bug. The fix:
-1. Delete the corrupted IF node
-2. Add a new IF node
-3. Recreate the condition and rewire both outputs
-
-Do NOT try to fix the existing node — the internal output mapping is corrupted and can only be fixed by recreation.
+n8n import corruption. Delete the IF node, add a new one, recreate conditions and connections.
 
 ---
 
 ## 10. Useful SQL Commands
 
-### View Circuit State
 ```sql
+-- View circuit state
 SELECT * FROM circuit_state WHERE circuit_key = 'supervisor';
-```
 
-### Reset Circuit Breaker
-```sql
-UPDATE circuit_state
-SET status = 'closed', error_count = 0, updated_at = NOW()
+-- Reset circuit
+UPDATE circuit_state SET status = 'closed', error_count = 0, updated_at = NOW()
 WHERE circuit_key = 'supervisor';
-```
 
-### Recent Events (Last 1 Hour)
-```sql
-SELECT event_type, workflow_name, execution_id, severity, created_at
-FROM supervisor_events
-WHERE created_at > NOW() - INTERVAL '1 hour'
+-- Recent events
+SELECT event_type, workflow_name, severity, status, created_at
+FROM supervisor_events WHERE created_at > NOW() - INTERVAL '1 hour'
 ORDER BY created_at DESC;
-```
 
-### Error Trends
-```sql
-SELECT
-  COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS errors_last_hour,
-  COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS errors_last_24h,
-  COUNT(*) AS errors_total
-FROM supervisor_events
-WHERE event_type = 'error_alert';
-```
+-- Error trends
+SELECT 
+  COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS errors_1h,
+  COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS errors_24h
+FROM supervisor_events WHERE event_type = 'error_alert';
 
-### Event Type Distribution
-```sql
-SELECT event_type, COUNT(*), MAX(created_at) AS last_seen
-FROM supervisor_events
-GROUP BY event_type
-ORDER BY COUNT(*) DESC;
-```
+-- Retry activity
+SELECT COUNT(*) FROM supervisor_events
+WHERE event_type = 'error_alert' AND status = 'retry_submitted'
+AND created_at > NOW() - INTERVAL '24 hours';
 
-### Clear All Events (Testing Only)
-```sql
--- ⚠️ Only use during testing — this deletes all audit history
-DELETE FROM supervisor_events;
-```
+-- Event distribution
+SELECT event_type, status, COUNT(*), MAX(created_at) AS last_seen
+FROM supervisor_events GROUP BY event_type, status ORDER BY count DESC;
 
-### Remove V23 Tables (Optional)
-```sql
--- Only run after confirming V1 Lean is stable in production
-DROP TABLE IF EXISTS error_logs CASCADE;
-DROP TABLE IF EXISTS alert_log CASCADE;
-DROP TABLE IF EXISTS pending_approvals CASCADE;
-DROP TABLE IF EXISTS dead_letter_queue CASCADE;
--- Optional: remove extension if no longer needed
--- DROP EXTENSION IF EXISTS pg_trgm;
+-- Table health
+SELECT pg_size_pretty(pg_total_relation_size('supervisor_events')) AS table_size,
+       pg_size_pretty(pg_indexes_size('supervisor_events')) AS index_size,
+       (SELECT COUNT(*) FROM supervisor_events) AS total_rows;
 ```
 
 ---
 
 ## 11. Startup Script
 
-Save this as `start-n8n.ps1` in your n8n directory:
+Save as `start-n8n.ps1`:
 
 ```powershell
 # ═══════════════════════════════════════════════════════════
 # Supervisor V1 Lean + Shiny Gmail — n8n Startup Script
 # ═══════════════════════════════════════════════════════════
 
-# n8n runtime requirements
-$env:NODE_FUNCTION_ALLOW_BUILTIN = "crypto"
-$env:N8N_BLOCK_ENV_ACCESS_IN_NODE = "false"
-$env:N8N_CONCURRENCY_PRODUCTION_LIMIT = "3"
-
-# Healthchecks.io Dead Man's Switch
-$env:HEALTHCHECKS_PING_URL = "https://hc-ping.com/YOUR-UUID-HERE"
-
-# Supervisor V1 Lean — workflow IDs
+# n8n runtime — Supervisor V1 Lean
 $env:SUPERVISOR_WORKFLOW_ID = "YOUR-SUPERVISOR-ID"
 $env:HEARTBEAT_WORKFLOW_ID = "YOUR-HEARTBEAT-ID"
 $env:RETENTION_WORKFLOW_ID = "YOUR-RETENTION-ID"
+$env:TELEGRAM_CHAT_ID = "YOUR-CHAT-ID"
+$env:CRITICAL_WORKFLOW_IDS = "ID1,ID2,ID3"
+# $env:LONG_RUNNING_WORKFLOW_IDS = ""
+# $env:NEVER_RETRY_WORKFLOW_IDS = ""
 
-# Shiny Gmail — environment variables (if using)
+# Shiny Gmail (if using)
 $env:GMAIL_ACCOUNT = "primary"
 $env:GEMINI_API_KEY = "YOUR-GEMINI-API-KEY"
 $env:GEMINI_MODEL = "gemini-3.1-flash-lite"
-$env:TELEGRAM_CHAT_ID = "YOUR-TELEGRAM-CHAT-ID"
 $env:TELEGRAM_ALLOW_GROUP_RULES = "false"
 $env:WEBHOOK_URL = "https://plywood-visor-plutonium.ngrok-free.dev"
 
-# Start ngrok (for Shiny Gmail Telegram webhook — minimize window)
+# Start ngrok (for Shiny Gmail Telegram webhook)
 Start-Process -FilePath "ngrok" -ArgumentList "http", "5678", "--domain", "plywood-visor-plutonium.ngrok-free.dev" -WindowStyle Minimized
 Start-Sleep -Seconds 3
 
 # Start n8n
+$env:NODE_FUNCTION_ALLOW_BUILTIN = "crypto"
+$env:N8N_BLOCK_ENV_ACCESS_IN_NODE = "false"
+$env:N8N_CONCURRENCY_PRODUCTION_LIMIT = "3"
+
+# Healthchecks.io
+$env:HEALTHCHECKS_PING_URL = "https://hc-ping.com/YOUR-UUID"
+
 npx n8n
-```
-
-> **Remember:** Replace all `YOUR-*-HERE` placeholders with actual values.
-
-### First-Time PowerShell Setup
-
-If the script won't run:
-
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass
 ```
 
 ---
 
 ## 12. Production Checklist
 
-Run through this checklist before considering the system "live":
-
 ### Database
-- [ ] Schema deployed (3 tables created)
-- [ ] circuit_state initialized (status='closed', error_count=0)
+
+- [ ] Schema deployed (3 tables)
+- [ ] circuit_state initialized (closed, 0)
 - [ ] schema_versions shows 'v1_lean'
+- [ ] Orphan dedup index uses time-bucketing
 
 ### Environment
+
 - [ ] NODE_FUNCTION_ALLOW_BUILTIN = "crypto"
 - [ ] N8N_BLOCK_ENV_ACCESS_IN_NODE = "false"
-- [ ] HEALTHCHECKS_PING_URL set and valid
-- [ ] SUPERVISOR_WORKFLOW_ID set (actual ID, not placeholder)
-- [ ] HEARTBEAT_WORKFLOW_ID set (actual ID, not placeholder)
-- [ ] RETENTION_WORKFLOW_ID set (actual ID, not placeholder)
+- [ ] HEALTHCHECKS_PING_URL set
+- [ ] SUPERVISOR_WORKFLOW_ID set (actual ID)
+- [ ] HEARTBEAT_WORKFLOW_ID set (actual ID)
+- [ ] RETENTION_WORKFLOW_ID set (actual ID)
+- [ ] TELEGRAM_CHAT_ID set
+- [ ] CRITICAL_WORKFLOW_IDS set
 
 ### Credentials
-- [ ] Postgres credential assigned to all Postgres nodes
-- [ ] Telegram Bot credential assigned to all Telegram nodes
-- [ ] HTTP Header Auth credential assigned to HTTP (Running Executions)
 
-### Configuration
-- [ ] All 8 Telegram nodes have actual chat ID (not REPLACE_WITH_TELEGRAM_CHAT_ID)
+- [ ] Postgres credential on all Postgres nodes
+- [ ] Telegram Bot credential on all Telegram nodes
+- [ ] HTTP Header Auth on all HTTP Request nodes with auth
+
+### Workflows
+
 - [ ] All 3 workflows activated
 - [ ] All monitored workflows have Error Workflow set to Supervisor Core
 
 ### Smoke Tests
+
 - [ ] Test 1: Heartbeat received ✅
 - [ ] Test 2: Healthchecks.io shows UP ✅
-- [ ] Test 3: Database tables verified ✅
-- [ ] Test 4: Error alert received ✅
+- [ ] Test 3: Database verified ✅
+- [ ] Test 4: Error alert with probable cause ✅
 - [ ] Test 5: Debounce working ✅
 - [ ] Test 6: Circuit breaker opens at 5 ✅
 - [ ] Test 7: Self-loop detected ✅
-- [ ] Test 8: Retention report received ✅
+- [ ] Test 8: Retention completed ✅
 
-### Post-Test Cleanup
-- [ ] Test Error Generator deactivated/deleted
-- [ ] Circuit breaker reset to closed
-- [ ] Test events cleaned up (optional)
+### Security
+
+- [ ] n8n version checked against CVE-2026-44789/44790/44791 (affects < 2.20.7)
 
 ---
 
@@ -724,9 +511,10 @@ Run through this checklist before considering the system "live":
 ├─────────────────────────────────────────────────┤
 │                                                 │
 │  Workflows:    3                                │
-│  Nodes:        46 executable + 3 sticky = 49    │
+│  Nodes:        50 executable + 3 sticky = 53    │
 │  DB Tables:    3                                │
 │  AI Cost:      $0                               │
+│  Audit Rounds: 10 (114 approved changes)        │
 │                                                 │
 │  Schedules:                                     │
 │    Heartbeat:  every 5 minutes                  │
@@ -734,15 +522,18 @@ Run through this checklist before considering the system "live":
 │    Supervisor: on-demand (Error Trigger)        │
 │                                                 │
 │  Circuit Breaker:                               │
-│    Opens at:   5 errors                         │
+│    Opens at:   5 errors within 15 min           │
 │    Recovery:   5 min → half_open                │
 │                10 min → closed                  │
 │    Safety:     1 hour → auto-reset (retention)  │
+│    Decay:      count resets if last error >15m  │
 │                                                 │
 │  Debounce:     30 seconds                       │
 │  Retention:    90 days                          │
 │  DMS Grace:    30 minutes                       │
 │  Orphan:       >30 min running                  │
+│  Auto-Retry:   max 2/fingerprint/hour           │
+│  Backoff:      15s base, 2^n, 120s cap          │
 │                                                 │
 │  Reset Circuit:                                 │
 │    UPDATE circuit_state                         │
@@ -755,7 +546,8 @@ Run through this checklist before considering the system "live":
 
 ---
 
-**End of Deployment Guide**
+## End of Deployment Guide
 
-*Last updated: 2026-05-24*
-*Supervisor V1 Lean — 3 workflows, 46 nodes, $0/month*
+Last updated: 2026-05-25  
+Supervisor V1 Lean — 3 workflows, 50 nodes, $0/month  
+10 review cycles, 114 approved changes

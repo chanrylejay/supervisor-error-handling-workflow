@@ -1,6 +1,6 @@
 {
   "name": "Heartbeat Monitor V1 Lean",
-  "description": "5-minute scheduled health monitor with circuit reset probe, parameterized recovery logging, error rate trend detection with per-workflow breakdown, DMS ping with deliberate state lifecycle, orphan execution detection with long-runner exclusion, activation monitoring with uncertainty handling, MD5 heartbeat dedup with HEALTHY/DEGRADED/CRITICAL verdict, mini-dashboard formatting, emergency cache pickup, and event logging.",
+  "description": "5-minute scheduled health monitor with DMS start/completion lifecycle, circuit reset probe with absorbed recovery event, error rate trend with per-workflow breakdown and direction arrows, orphan detection with alert memory and confidence state, activation monitoring with edge-triggered alerts, MD5 heartbeat dedup with HEALTHY/DEGRADED/CRITICAL verdict and recovery banner with subsystem context, consolidated orphan/API-error alert path, silent healthy notifications, compact HTML links, and delivery-independent event logging.",
   "nodes": [
     {
       "parameters": {
@@ -16,15 +16,28 @@
     },
     {
       "parameters": {
+        "method": "GET",
+        "url": "={{ $env.HEALTHCHECKS_PING_URL + '/start' }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "http-dms-start-v1l",
+      "name": "HTTP (DMS Start)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [200, 300],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
         "operation": "executeQuery",
-        "query": "WITH recover_open AS (\n  UPDATE circuit_state\n  SET status = 'half_open', updated_at = NOW(), half_open_at = NOW()\n  WHERE circuit_key = 'supervisor'\n    AND status = 'open'\n    AND last_error_at < NOW() - INTERVAL '5 minutes'\n  RETURNING circuit_key, status, 'open' AS previous_status\n),\nreset_half_open AS (\n  UPDATE circuit_state\n  SET status = 'closed', error_count = 0, updated_at = NOW()\n  WHERE circuit_key = 'supervisor'\n    AND status = 'half_open'\n    AND last_error_at < NOW() - INTERVAL '10 minutes'\n    AND NOT EXISTS (SELECT 1 FROM recover_open)\n  RETURNING circuit_key, status, 'half_open' AS previous_status\n)\nSELECT\n  circuit_key,\n  status,\n  previous_status,\n  'heartbeat-recovery-' || EXTRACT(EPOCH FROM NOW())::INTEGER AS trace_id,\n  CASE WHEN previous_status = 'open' THEN 5 ELSE 10 END AS cooldown_minutes\nFROM recover_open\nUNION ALL\nSELECT\n  circuit_key,\n  status,\n  previous_status,\n  'heartbeat-recovery-' || EXTRACT(EPOCH FROM NOW())::INTEGER AS trace_id,\n  CASE WHEN previous_status = 'open' THEN 5 ELSE 10 END AS cooldown_minutes\nFROM reset_half_open",
+        "query": "WITH recover_open AS (\n  UPDATE circuit_state\n  SET status = 'half_open', updated_at = NOW(), half_open_at = NOW()\n  WHERE circuit_key = 'supervisor'\n    AND status = 'open'\n    AND last_error_at < NOW() - INTERVAL '5 minutes'\n  RETURNING circuit_key, status, 'open' AS previous_status,\n    'heartbeat-recovery-' || EXTRACT(EPOCH FROM NOW())::INTEGER AS trace_id,\n    CASE WHEN 'open' = 'open' THEN 5 ELSE 10 END AS cooldown_minutes\n),\nreset_half_open AS (\n  UPDATE circuit_state\n  SET status = 'closed', error_count = 0, updated_at = NOW()\n  WHERE circuit_key = 'supervisor'\n    AND status = 'half_open'\n    AND last_error_at < NOW() - INTERVAL '10 minutes'\n    AND NOT EXISTS (SELECT 1 FROM recover_open)\n  RETURNING circuit_key, status, 'half_open' AS previous_status,\n    'heartbeat-recovery-' || EXTRACT(EPOCH FROM NOW())::INTEGER AS trace_id,\n    CASE WHEN 'half_open' = 'open' THEN 5 ELSE 10 END AS cooldown_minutes\n)\nSELECT circuit_key, status, previous_status, trace_id, cooldown_minutes FROM recover_open\nUNION ALL\nSELECT circuit_key, status, previous_status, trace_id, cooldown_minutes FROM reset_half_open",
         "options": { "alwaysOutputData": true }
       },
       "id": "pg-circuit-reset-v1l",
       "name": "Circuit Reset Probe",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [250, 300],
+      "position": [400, 300],
       "onError": "continueErrorOutput"
     },
     {
@@ -47,92 +60,34 @@
       "name": "Has Recovery Transition?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [750, 300]
+      "position": [600, 300]
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, severity, status, payload)\nVALUES (\n  ($1::jsonb)->>'traceId',\n  'circuit_transition',\n  'Heartbeat Monitor',\n  'heartbeat',\n  'info',\n  ($1::jsonb)->>'to',\n  jsonb_build_object('from', ($1::jsonb)->>'from', 'to', ($1::jsonb)->>'to', 'reason', ($1::jsonb)->>'reason', 'cooldown_minutes', (($1::jsonb)->>'cooldownMinutes')::integer)\n)",
+        "query": "INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, severity, status, payload)\nVALUES (\n  ($1::jsonb)->>'traceId',\n  'circuit_transition',\n  'Heartbeat Monitor',\n  'heartbeat',\n  'info',\n  ($1::jsonb)->>'to',\n  jsonb_build_object('from', ($1::jsonb)->>'from', 'to', ($1::jsonb)->>'to', 'reason', 'heartbeat_recovery_probe', 'cooldown_minutes', (($1::jsonb)->>'cooldownMinutes')::integer)\n)",
         "options": {
-          "queryReplacement": "={{ JSON.stringify({ traceId: $json.trace_id, to: $json.status, from: $json.previous_status, cooldownMinutes: $json.cooldown_minutes, reason: 'heartbeat_recovery_probe' }) }}"
+          "queryReplacement": "={{ JSON.stringify({ traceId: $json.trace_id, from: $json.previous_status, to: $json.status, cooldownMinutes: $json.cooldown_minutes }) }}"
         }
       },
       "id": "pg-log-recovery-v1l",
       "name": "Log Circuit Recovery",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [1000, 200],
+      "position": [800, 200],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH cs AS (\n  SELECT\n    COALESCE(\n      (SELECT status FROM circuit_state WHERE circuit_key = 'supervisor'),\n      'closed'\n    ) AS circuit_status,\n    COALESCE(\n      (SELECT error_count FROM circuit_state WHERE circuit_key = 'supervisor'),\n      0\n    ) AS error_count\n),\nevt AS (\n  SELECT event_type, workflow_name, created_at\n  FROM supervisor_events\n  WHERE created_at > NOW() - INTERVAL '24 hours'\n),\nagg AS (\n  SELECT\n    COUNT(*) FILTER (WHERE event_type = 'error_alert' AND created_at > NOW() - INTERVAL '1 hour') AS errors_last_hour,\n    COUNT(*) FILTER (WHERE event_type = 'error_alert') AS errors_last_24h,\n    MAX(created_at) FILTER (WHERE event_type = 'heartbeat') AS last_heartbeat_at\n  FROM evt\n),\ntop_src AS (\n  SELECT workflow_name, COUNT(*) AS error_count,\n    COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS errors_1h\n  FROM evt\n  WHERE event_type = 'error_alert'\n  GROUP BY workflow_name\n  ORDER BY error_count DESC\n  LIMIT 5\n)\nSELECT\n  cs.circuit_status,\n  cs.error_count,\n  agg.errors_last_hour,\n  agg.errors_last_24h,\n  agg.last_heartbeat_at,\n  COALESCE((SELECT jsonb_agg(row_to_json(t)) FROM top_src t), '[]'::jsonb) AS top_error_sources\nFROM cs CROSS JOIN agg",
+        "query": "WITH cs AS (\n  SELECT\n    COALESCE(\n      (SELECT status FROM circuit_state WHERE circuit_key = 'supervisor'),\n      'closed'\n    ) AS circuit_status,\n    COALESCE(\n      (SELECT error_count FROM circuit_state WHERE circuit_key = 'supervisor'),\n      0\n    ) AS error_count\n),\nevt AS (\n  SELECT event_type, workflow_name, created_at, status\n  FROM supervisor_events\n  WHERE created_at > NOW() - INTERVAL '24 hours'\n),\nagg AS (\n  SELECT\n    COUNT(*) FILTER (WHERE event_type = 'error_alert' AND created_at > NOW() - INTERVAL '1 hour') AS errors_last_hour,\n    COUNT(*) FILTER (WHERE event_type = 'error_alert') AS errors_last_24h,\n    MAX(created_at) FILTER (WHERE event_type = 'heartbeat') AS last_heartbeat_at,\n    COUNT(*) FILTER (WHERE event_type = 'error_alert' AND status = 'retry_submitted' AND created_at > NOW() - INTERVAL '1 hour') AS retries_last_hour,\n    COUNT(*) FILTER (WHERE event_type = 'error_alert' AND status = 'retry_submitted') AS retries_last_24h\n  FROM evt\n),\ntop_src AS (\n  SELECT workflow_name, COUNT(*) AS error_count,\n    COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS errors_1h\n  FROM evt\n  WHERE event_type = 'error_alert'\n  GROUP BY workflow_name\n  ORDER BY error_count DESC\n  LIMIT 5\n)\nSELECT\n  cs.circuit_status,\n  cs.error_count,\n  agg.errors_last_hour,\n  agg.errors_last_24h,\n  agg.last_heartbeat_at,\n  agg.retries_last_hour,\n  agg.retries_last_24h,\n  COALESCE((SELECT jsonb_agg(row_to_json(t)) FROM top_src t), '[]'::jsonb) AS top_error_sources\nFROM cs CROSS JOIN agg",
         "options": { "alwaysOutputData": true }
       },
       "id": "pg-system-status-v1l",
       "name": "System Status",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [1250, 300],
-      "onError": "continueErrorOutput"
-    },
-    {
-      "parameters": {
-        "method": "GET",
-        "url": "={{ $env.HEALTHCHECKS_PING_URL }}",
-        "options": { "timeout": 10000 }
-      },
-      "id": "http-dms-v1l",
-      "name": "HTTP (DMS Ping)",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [1500, 300],
-      "onError": "continueErrorOutput"
-    },
-    {
-      "parameters": {
-        "jsCode": "const item = $input.first().json || {};\nconst staticData = $getWorkflowStaticData('global');\n\nconst isError = !!(item.error && typeof item.error === 'object' && item.error.message);\n\nif (isError) {\n  staticData.lastDeadMansSwitchFailure = item.error.message;\n} else {\n  delete staticData.lastDeadMansSwitchFailure;\n}\n\nreturn [{\n  json: {\n    dmsFailure: isError,\n    dmsOk: !isError,\n    dmsErrorMessage: isError ? item.error.message : '',\n    dmsFiredThisCycle: isError\n  }\n}];"
-      },
-      "id": "code-check-dms-v1l",
-      "name": "Check DMS Result",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [1750, 300]
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
-          "conditions": [
-            {
-              "id": "dms-fail-cond-v1l",
-              "leftValue": "={{ $json.dmsFailure }}",
-              "rightValue": true,
-              "operator": { "type": "boolean", "operation": "equals" }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      },
-      "id": "if-dms-failed-v1l",
-      "name": "Has DMS Failed?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2,
-      "position": [2000, 300]
-    },
-    {
-      "parameters": {
-        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
-        "text": "=\uD83D\uDD34 <b>DEAD MAN'S SWITCH FAILURE</b>\n\nHealthchecks.io ping failed.\n\n<b>Error:</b> <code>{{ $json.dmsErrorMessage.substring(0, 300) }}</code>\n<b>Timestamp:</b> {{ $now.setZone('Asia/Manila').toFormat('MMM dd, yyyy, HH:mm:ss') }}\n\n\u26A0\uFE0F External monitoring may be offline.",
-        "additionalFields": { "parse_mode": "HTML" }
-      },
-      "id": "tg-dms-failure-v1l",
-      "name": "Telegram (DMS Failure)",
-      "type": "n8n-nodes-base.telegram",
-      "typeVersion": 1.1,
-      "position": [2250, 100],
+      "position": [1050, 300],
       "onError": "continueErrorOutput"
     },
     {
@@ -147,18 +102,18 @@
       "name": "HTTP (Running Executions)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2250, 400],
+      "position": [1300, 300],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "const item = $input.first().json || {};\nconst staticData = $getWorkflowStaticData('global');\n\nfunction htmlEscape(text) {\n  return String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nfunction truncateRaw(text, max) {\n  var value = String(text || '');\n  return value.length <= max ? value : value.slice(0, max - 1) + '…';\n}\n\nconst orphanAlertKey = 'orphan_alert_memory';\nconst orphanMemory = staticData[orphanAlertKey] || {};\nconst ORPHAN_REALERT_MS = 60 * 60 * 1000; // 1 hour\n\nif (item.error || (typeof item === 'object' && item.error)) {\n  staticData.orphanUncertainty = {\n    timestamp: new Date().toISOString(),\n    reason: item.error?.message || 'n8n API unreachable during orphan detection'\n  };\n  return [{\n    json: {\n      apiError: true,\n      hasOrphans: false,\n      hasAlertableOrphans: false,\n      orphans: [],\n      orphanCount: 0,\n      alertableOrphanCount: 0,\n      orphanArray: '[]',\n      orphanAlertText: '',\n      orphanState: 'api_error',\n      errorMessage: item.error?.message || 'API unreachable'\n    }\n  }];\n}\n\nconst data = item.data || item;\nconst arr = Array.isArray(data) ? data : (Array.isArray(data.data) ? data.data : []);\n\nif (!Array.isArray(arr)) {\n  staticData.orphanUncertainty = {\n    timestamp: new Date().toISOString(),\n    reason: 'Unexpected n8n API response shape during orphan detection'\n  };\n  return [{\n    json: {\n      apiError: true,\n      hasOrphans: false,\n      hasAlertableOrphans: false,\n      orphans: [],\n      orphanCount: 0,\n      alertableOrphanCount: 0,\n      orphanArray: '[]',\n      orphanAlertText: '',\n      orphanState: 'api_error',\n      errorMessage: 'Unexpected n8n API response shape'\n    }\n  }];\n}\n\nconst healthData = (() => {\n  try { return $('System Status').first().json || {}; } catch (e) { return {}; }\n})();\n\nif (arr.length === 0) {\n  const isActiveSystem = healthData.circuit_status === 'open' || healthData.circuit_status === 'half_open' || !!healthData.error;\n  if (isActiveSystem) {\n    staticData.orphanUncertainty = {\n      timestamp: new Date().toISOString(),\n      reason: 'API returned 0 running executions during active/degraded system'\n    };\n    return [{ json: { apiError: false, hasOrphans: false, hasAlertableOrphans: false, orphans: [], orphanCount: 0, alertableOrphanCount: 0, orphanArray: '[]', orphanAlertText: '', orphanState: 'uncertain', uncertainResult: true } }];\n  }\n  delete staticData.orphanUncertainty;\n  return [{ json: { apiError: false, hasOrphans: false, hasAlertableOrphans: false, orphans: [], orphanCount: 0, alertableOrphanCount: 0, orphanArray: '[]', orphanAlertText: '', orphanState: 'none' } }];\n}\n\nconst now = Date.now();\nconst threshold = 30 * 60 * 1000;\nconst MONITORING_WORKFLOW_IDS = [\n  $env.SUPERVISOR_WORKFLOW_ID || '',\n  $env.HEARTBEAT_WORKFLOW_ID || '',\n  $env.RETENTION_WORKFLOW_ID || ''\n].filter(Boolean).map(String);\n\nconst LONG_RUNNING_IDS = String($env.LONG_RUNNING_WORKFLOW_IDS || '')\n  .split(',')\n  .map(s => s.trim())\n  .filter(Boolean);\n\nconst excludeIds = new Set([...MONITORING_WORKFLOW_IDS, ...LONG_RUNNING_IDS]);\n\nconst orphans = arr.filter(exec => {\n  const startedAtRaw = exec.startedAt || exec.createdAt;\n  const startedAt = new Date(startedAtRaw).getTime();\n  if (!startedAt || Number.isNaN(startedAt)) return false;\n  return (now - startedAt) > threshold && !excludeIds.has(String(exec.workflowId));\n}).map(exec => {\n  const baseUrl = $env.N8N_BASE_URL || 'http://localhost:5678';\n  return {\n    executionId: String(exec.id),\n    workflowId: String(exec.workflowId || 'unknown'),\n    workflowName: exec.workflowName || exec.workflow?.name || 'unknown',\n    startedAt: exec.startedAt || exec.createdAt,\n    runningMinutes: Math.round((now - new Date(exec.startedAt || exec.createdAt).getTime()) / 60000),\n    executionUrl: baseUrl + '/executions/' + String(exec.id)\n  };\n});\n\nif (orphans.length === 0) {\n  delete staticData.orphanUncertainty;\n}\n\nconst alertableOrphans = orphans.filter(o => {\n  var last = orphanMemory[o.executionId] || 0;\n  return (now - last) > ORPHAN_REALERT_MS;\n});\n\nfor (var ao of alertableOrphans) {\n  orphanMemory[ao.executionId] = now;\n}\n\nfor (var [id, ts] of Object.entries(orphanMemory)) {\n  if (now - ts > 24 * 60 * 60 * 1000) delete orphanMemory[id];\n}\nstaticData[orphanAlertKey] = orphanMemory;\n\nvar displayOrphans = alertableOrphans\n  .sort(function(a, b) { return b.runningMinutes - a.runningMinutes; })\n  .slice(0, 5);\nvar omittedCount = Math.max(alertableOrphans.length - 5, 0);\n\nvar orphanArray = orphans.map(function(o) {\n  return {\n    executionId: o.executionId,\n    workflowId: o.workflowId,\n    workflowName: o.workflowName,\n    runningMinutes: o.runningMinutes,\n    orphanCount: orphans.length\n  };\n});\n\nvar orphanAlertText = '';\nif (displayOrphans.length > 0) {\n  var baseUrl = $env.N8N_BASE_URL || 'http://localhost:5678';\n  orphanAlertText = displayOrphans.map(function(o) {\n    return '<b>Execution:</b> ' + baseUrl + '/executions/' + o.executionId + '\n<b>Workflow:</b> ' + htmlEscape(truncateRaw(o.workflowName, 100)) + '\n<b>Running:</b> ' + o.runningMinutes + ' minutes';\n  }).join('\n---\n');\n  if (omittedCount > 0) {\n    orphanAlertText += '\n\n…and ' + omittedCount + ' more orphan(s) omitted.';\n  }\n  orphanAlertText = '⚠️ <b>ORPHAN EXECUTION DETECTED</b>\n\n' + orphanAlertText + '\n\n<b>Total Orphans:</b> ' + alertableOrphans.length + '\n<b>Timestamp:</b> ' + new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila', year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });\n}\n\nreturn [{\n  json: {\n    apiError: false,\n    hasOrphans: orphans.length > 0,\n    hasAlertableOrphans: alertableOrphans.length > 0,\n    orphanCount: orphans.length,\n    alertableOrphanCount: alertableOrphans.length,\n    orphanArray: JSON.stringify(orphanArray),\n    orphanAlertText: orphanAlertText,\n    orphanState: 'found'\n  }\n}];"
+        "jsCode": "const item = $input.first().json || {};\nconst staticData = $getWorkflowStaticData('global');\n\nfunction htmlEscape(text) {\n  return String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nfunction truncateRaw(text, max) {\n  var value = String(text || '');\n  return value.length <= max ? value : value.slice(0, max - 1) + '\\u2026';\n}\n\nif (item.error || (typeof item === 'object' && item.error)) {\n  var apiErrMsg = item.error?.message || 'n8n API unreachable';\n  var apiErrorHash = String(apiErrMsg).slice(0, 300);\n  var lastApiErrorHash = staticData.lastApiErrorHash || '';\n  var lastApiErrorAt = staticData.lastApiErrorAt || 0;\n  var now0 = Date.now();\n  var shouldAlertApiError = apiErrorHash !== lastApiErrorHash || (now0 - lastApiErrorAt) > 3600000;\n  if (shouldAlertApiError) {\n    staticData.lastApiErrorHash = apiErrorHash;\n    staticData.lastApiErrorAt = now0;\n  }\n  staticData.orphanUncertainty = { timestamp: new Date().toISOString(), reason: apiErrMsg };\n  return [{\n    json: {\n      orphanState: 'api_error',\n      apiError: true,\n      hasOrphans: false,\n      hasAlertableOrphans: false,\n      shouldAlertOrphans: shouldAlertApiError,\n      orphanCount: 0,\n      alertableOrphanCount: 0,\n      orphanArray: '[]',\n      orphanAlertText: shouldAlertApiError\n        ? '\\u{1F534} <b>HEARTBEAT \\u2014 API UNREACHABLE</b>\\n\\nn8n API at localhost:5678 is not responding.\\nOrphan detection may be incomplete this cycle.\\n\\n<b>Error:</b> <code>' + htmlEscape(truncateRaw(apiErrMsg, 300)) + '</code>\\n<b>Timestamp:</b> ' + new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila', year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })\n        : '',\n      errorMessage: apiErrMsg\n    }\n  }];\n}\n\nvar data = item.data || item;\nvar arr = Array.isArray(data) ? data : (Array.isArray(data.data) ? data.data : []);\n\nif (!Array.isArray(arr)) {\n  staticData.orphanUncertainty = { timestamp: new Date().toISOString(), reason: 'Unexpected n8n API response shape' };\n  return [{\n    json: {\n      orphanState: 'api_error',\n      apiError: true,\n      hasOrphans: false,\n      hasAlertableOrphans: false,\n      shouldAlertOrphans: false,\n      orphanCount: 0,\n      alertableOrphanCount: 0,\n      orphanArray: '[]',\n      orphanAlertText: '',\n      errorMessage: 'Unexpected API response shape'\n    }\n  }];\n}\n\nvar healthData = (function() { try { return $('System Status').first().json || {}; } catch(e) { return {}; } })();\n\nif (arr.length === 0) {\n  var isActiveSystem = healthData.circuit_status === 'open' || healthData.circuit_status === 'half_open' || !!healthData.error;\n  if (isActiveSystem) {\n    staticData.orphanUncertainty = { timestamp: new Date().toISOString(), reason: 'API returned 0 running during active system' };\n    return [{ json: { orphanState: 'uncertain', apiError: false, hasOrphans: false, hasAlertableOrphans: false, shouldAlertOrphans: false, orphanCount: 0, alertableOrphanCount: 0, orphanArray: '[]', orphanAlertText: '' } }];\n  }\n  delete staticData.orphanUncertainty;\n  return [{ json: { orphanState: 'none', apiError: false, hasOrphans: false, hasAlertableOrphans: false, shouldAlertOrphans: false, orphanCount: 0, alertableOrphanCount: 0, orphanArray: '[]', orphanAlertText: '' } }];\n}\n\nvar now = Date.now();\nvar threshold = 30 * 60 * 1000;\nvar MONITORING_WORKFLOW_IDS = [\n  $env.SUPERVISOR_WORKFLOW_ID || '',\n  $env.HEARTBEAT_WORKFLOW_ID || '',\n  $env.RETENTION_WORKFLOW_ID || ''\n].filter(Boolean).map(String);\n\nvar LONG_RUNNING_IDS = String($env.LONG_RUNNING_WORKFLOW_IDS || '').split(',').map(function(s) { return s.trim(); }).filter(Boolean);\nvar excludeIds = new Set([].concat(MONITORING_WORKFLOW_IDS, LONG_RUNNING_IDS));\n\nvar baseUrl = $env.N8N_BASE_URL || 'http://localhost:5678';\n\nvar orphans = arr.filter(function(exec) {\n  var startedAtRaw = exec.startedAt || exec.createdAt;\n  var startedAt = new Date(startedAtRaw).getTime();\n  if (!startedAt || Number.isNaN(startedAt)) return false;\n  return (now - startedAt) > threshold && !excludeIds.has(String(exec.workflowId));\n}).map(function(exec) {\n  return {\n    executionId: String(exec.id),\n    workflowId: String(exec.workflowId || 'unknown'),\n    workflowName: exec.workflowName || exec.workflow?.name || 'unknown',\n    startedAt: exec.startedAt || exec.createdAt,\n    runningMinutes: Math.round((now - new Date(exec.startedAt || exec.createdAt).getTime()) / 60000),\n    executionUrl: baseUrl + '/executions/' + String(exec.id)\n  };\n});\n\nvar orphanAlertKey = 'orphan_alert_memory';\nvar orphanMemory = staticData[orphanAlertKey] || {};\nvar ORPHAN_REALERT_MS = 60 * 60 * 1000;\n\nvar alertableOrphans = orphans.filter(function(o) {\n  var last = orphanMemory[o.executionId] || 0;\n  return (now - last) > ORPHAN_REALERT_MS;\n});\n\nfor (var ao of alertableOrphans) { orphanMemory[ao.executionId] = now; }\nfor (var eid of Object.keys(orphanMemory)) {\n  if (now - orphanMemory[eid] > 24 * 60 * 60 * 1000) delete orphanMemory[eid];\n}\nstaticData[orphanAlertKey] = orphanMemory;\n\nif (orphans.length === 0) { delete staticData.orphanUncertainty; }\n\nvar displayOrphans = alertableOrphans\n  .sort(function(a, b) { return b.runningMinutes - a.runningMinutes; })\n  .slice(0, 5);\nvar omittedCount = Math.max(alertableOrphans.length - 5, 0);\n\nvar orphanArray = orphans.map(function(o) {\n  return { executionId: o.executionId, workflowId: o.workflowId, workflowName: o.workflowName, runningMinutes: o.runningMinutes, orphanCount: orphans.length };\n});\n\nvar orphanAlertText = '';\nif (displayOrphans.length > 0) {\n  orphanAlertText = '\\u26A0\\uFE0F <b>ORPHAN EXECUTION DETECTED</b>\\n\\n';\n  orphanAlertText += displayOrphans.map(function(o) {\n    return '<b>Execution:</b> \"'' + '\\n<b>Workflow:</b> ' + htmlEscape(truncateRaw(o.workflowName, 100)) + '\\n<b>Running:</b> ' + o.runningMinutes + ' minutes';\n  }).join('\\n---\\n');\n  if (omittedCount > 0) { orphanAlertText += '\\n\\n\\u2026and ' + omittedCount + ' more orphan(s) omitted.'; }\n  orphanAlertText += '\\n\\n<b>Total Orphans:</b> ' + alertableOrphans.length;\n  orphanAlertText += '\\n<b>Timestamp:</b> ' + new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila', year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });\n}\n\nreturn [{\n  json: {\n    orphanState: orphans.length > 0 ? 'found' : 'none',\n    apiError: false,\n    hasOrphans: orphans.length > 0,\n    hasAlertableOrphans: alertableOrphans.length > 0,\n    shouldAlertOrphans: alertableOrphans.length > 0,\n    orphanCount: orphans.length,\n    alertableOrphanCount: alertableOrphans.length,\n    orphanArray: JSON.stringify(orphanArray),\n    orphanAlertText: orphanAlertText\n  }\n}];"
       },
       "id": "code-detect-orphans-v1l",
       "name": "Detect Orphans",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2500, 400]
+      "position": [1550, 300]
     },
     {
       "parameters": {
@@ -166,8 +121,8 @@
           "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
           "conditions": [
             {
-              "id": "api-error-cond-v1l",
-              "leftValue": "={{ $json.apiError }}",
+              "id": "should-alert-orphans-cond-v1l",
+              "leftValue": "={{ $json.shouldAlertOrphans }}",
               "rightValue": true,
               "operator": { "type": "boolean", "operation": "equals" }
             }
@@ -176,46 +131,11 @@
         },
         "options": {}
       },
-      "id": "if-api-error-v1l",
-      "name": "Has API Error?",
+      "id": "if-should-alert-orphans-v1l",
+      "name": "Should Alert Orphans?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [2750, 250]
-    },
-    {
-      "parameters": {
-        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
-        "text": "=\uD83D\uDD34 <b>HEARTBEAT \u2014 API UNREACHABLE</b>\n\nn8n API at localhost:5678 is not responding.\nOrphan detection may be incomplete this cycle.\n\n<b>Error:</b> <code>{{ $json.errorMessage }}</code>\n<b>Timestamp:</b> {{ $now.setZone('Asia/Manila').toFormat('MMM dd, yyyy, HH:mm:ss') }}",
-        "additionalFields": { "parse_mode": "HTML" }
-      },
-      "id": "tg-api-error-v1l",
-      "name": "Telegram (API Error)",
-      "type": "n8n-nodes-base.telegram",
-      "typeVersion": 1.1,
-      "position": [3000, 150],
-      "onError": "continueErrorOutput"
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
-          "conditions": [
-            {
-              "id": "has-orphans-cond-v1l",
-              "leftValue": "={{ $json.hasAlertableOrphans }}",
-              "rightValue": true,
-              "operator": { "type": "boolean", "operation": "equals" }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      },
-      "id": "if-has-orphans-v1l",
-      "name": "Has Orphans?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2,
-      "position": [2750, 500]
+      "position": [1800, 300]
     },
     {
       "parameters": {
@@ -229,20 +149,20 @@
       "name": "Log Orphans",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [3000, 450],
+      "position": [2050, 200],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
         "text": "={{ $('Detect Orphans').first().json.orphanAlertText }}",
-        "additionalFields": { "parse_mode": "HTML" }
+        "additionalFields": { "parse_mode": "HTML", "disable_web_page_preview": true }
       },
       "id": "tg-orphan-alert-v1l",
       "name": "Telegram (Orphan Alert)",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.1,
-      "position": [3250, 450],
+      "position": [2050, 350],
       "onError": "continueErrorOutput"
     },
     {
@@ -257,18 +177,18 @@
       "name": "HTTP (Active Workflows)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2750, 750],
+      "position": [1800, 600],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "const crypto = require('crypto');\nconst item = $input.first().json || {};\nconst staticData = $getWorkflowStaticData('global');\nconst expectedIds = String($env.CRITICAL_WORKFLOW_IDS || '')\n  .split(',')\n  .map(s => s.trim())\n  .filter(Boolean);\n\nconst baseUrl = $env.N8N_BASE_URL || 'http://localhost:5678';\n\nif (expectedIds.length === 0) {\n  delete staticData.activationCheckUncertain;\n  return [{ json: { activationConfigured: false, activationIssue: false, hasDeactivated: false, activationUncertain: false, shouldAlertActivation: false, deactivatedIds: [], deactivatedUrls: [], activeCount: 0, expectedCount: 0, activationMessage: 'CRITICAL_WORKFLOW_IDS not configured' } }];\n}\n\nvar activationIssue = false;\nvar activationUncertain = false;\nvar hasDeactivated = false;\nvar deactivatedIds = [];\nvar deactivatedUrls = [];\nvar activeCount = 0;\n\nif (item.error && item.error.message) {\n  activationIssue = true;\n  activationUncertain = true;\n  staticData.activationCheckUncertain = {\n    timestamp: new Date().toISOString(),\n    reason: item.error.message\n  };\n} else {\n  const data = item.data || item;\n  const arr = Array.isArray(data) ? data : (Array.isArray(data.data) ? data.data : []);\n\n  if (!Array.isArray(arr)) {\n    activationIssue = true;\n    activationUncertain = true;\n    staticData.activationCheckUncertain = {\n      timestamp: new Date().toISOString(),\n      reason: 'Unexpected active workflows API response shape'\n    };\n  } else {\n    const activeIds = new Set(arr.map(w => String(w.id)));\n    deactivatedIds = expectedIds.filter(id => !activeIds.has(String(id)));\n    deactivatedUrls = deactivatedIds.map(id => baseUrl + '/workflow/' + id);\n    activeCount = activeIds.size;\n\n    if (deactivatedIds.length > 0) {\n      activationIssue = true;\n      activationUncertain = false;\n      hasDeactivated = true;\n      delete staticData.activationCheckUncertain;\n    } else {\n      activationIssue = false;\n      activationUncertain = false;\n      hasDeactivated = false;\n      delete staticData.activationCheckUncertain;\n    }\n  }\n}\n\nvar activationStateHash = crypto.createHash('sha1').update(JSON.stringify({\n  activationIssue: activationIssue,\n  activationUncertain: activationUncertain,\n  deactivatedIds: deactivatedIds.sort()\n})).digest('hex');\n\nvar lastActivationHash = staticData.lastActivationAlertHash || '';\nvar activationChanged = activationStateHash !== lastActivationHash;\nvar shouldAlertActivation = activationIssue && activationChanged;\n\nif (shouldAlertActivation) {\n  staticData.lastActivationAlertHash = activationStateHash;\n}\n\nreturn [{\n  json: {\n    activationConfigured: true,\n    activationIssue: activationIssue,\n    hasDeactivated: hasDeactivated,\n    activationUncertain: activationUncertain,\n    shouldAlertActivation: shouldAlertActivation,\n    deactivatedIds: deactivatedIds,\n    deactivatedUrls: deactivatedUrls,\n    activeCount: activeCount,\n    expectedCount: expectedIds.length,\n    activationMessage: activationIssue\n      ? (activationUncertain ? 'Activation check uncertain' : deactivatedIds.length + ' critical workflow(s) inactive')\n      : 'All critical workflows active'\n  }\n}];"
+        "jsCode": "const crypto = require('crypto');\nconst item = $input.first().json || {};\nconst staticData = $getWorkflowStaticData('global');\nvar expectedIds = String($env.CRITICAL_WORKFLOW_IDS || '').split(',').map(function(s) { return s.trim(); }).filter(Boolean);\nvar baseUrl = $env.N8N_BASE_URL || 'http://localhost:5678';\n\nif (expectedIds.length === 0) {\n  delete staticData.activationCheckUncertain;\n  return [{ json: { activationConfigured: false, activationIssue: false, hasDeactivated: false, activationUncertain: false, shouldAlertActivation: false, deactivatedIds: [], deactivatedUrls: [], activeCount: 0, expectedCount: 0, activationMessage: 'CRITICAL_WORKFLOW_IDS not configured' } }];\n}\n\nif (item.error && item.error.message) {\n  staticData.activationCheckUncertain = { timestamp: new Date().toISOString(), reason: item.error.message };\n  var h1 = crypto.createHash('sha1').update(JSON.stringify({ activationIssue: true, activationUncertain: true, deactivatedIds: [] })).digest('hex');\n  var changed1 = h1 !== (staticData.lastActivationAlertHash || '');\n  if (changed1) staticData.lastActivationAlertHash = h1;\n  return [{ json: { activationConfigured: true, activationIssue: true, hasDeactivated: false, activationUncertain: true, shouldAlertActivation: changed1, deactivatedIds: [], deactivatedUrls: [], activeCount: 0, expectedCount: expectedIds.length, activationMessage: item.error.message } }];\n}\n\nvar data = item.data || item;\nvar arr = Array.isArray(data) ? data : (Array.isArray(data.data) ? data.data : []);\n\nif (!Array.isArray(arr)) {\n  staticData.activationCheckUncertain = { timestamp: new Date().toISOString(), reason: 'Unexpected response shape' };\n  return [{ json: { activationConfigured: true, activationIssue: true, hasDeactivated: false, activationUncertain: true, shouldAlertActivation: false, deactivatedIds: [], deactivatedUrls: [], activeCount: 0, expectedCount: expectedIds.length, activationMessage: 'Unexpected response shape' } }];\n}\n\nvar activeIds = new Set(arr.map(function(w) { return String(w.id); }));\nvar deactivatedIds = expectedIds.filter(function(id) { return !activeIds.has(String(id)); });\nvar deactivatedUrls = deactivatedIds.map(function(id) { return baseUrl + '/workflow/' + id; });\n\nvar activationIssue = deactivatedIds.length > 0;\nvar activationUncertain = false;\nvar activationMessage = activationIssue ? deactivatedIds.length + ' critical workflow(s) inactive' : 'All critical workflows active';\n\nvar stateHash = crypto.createHash('sha1').update(JSON.stringify({ activationIssue: activationIssue, activationUncertain: false, deactivatedIds: deactivatedIds.sort() })).digest('hex');\nvar lastHash = staticData.lastActivationAlertHash || '';\nvar activationChanged = stateHash !== lastHash;\n\nif (activationIssue && activationChanged) { staticData.lastActivationAlertHash = stateHash; }\n\ndelete staticData.activationCheckUncertain;\n\nreturn [{ json: { activationConfigured: true, activationIssue: activationIssue, hasDeactivated: deactivatedIds.length > 0, activationUncertain: false, shouldAlertActivation: activationIssue && activationChanged, deactivatedIds: deactivatedIds, deactivatedUrls: deactivatedUrls, activeCount: activeIds.size, expectedCount: expectedIds.length, activationMessage: activationMessage } }];"
       },
       "id": "code-detect-activation-v1l",
       "name": "Detect Activation State",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [3000, 750]
+      "position": [2050, 600]
     },
     {
       "parameters": {
@@ -290,30 +210,30 @@
       "name": "Has Activation Issue?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [3250, 750]
+      "position": [2300, 600]
     },
     {
       "parameters": {
         "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
-        "text": "=\u26A0\uFE0F <b>WORKFLOW ACTIVATION CHECK</b>\n\n{{ $json.activationUncertain ? 'Activation check is uncertain. No workflow is being declared inactive from this result.' : 'One or more critical workflows appear inactive.' }}\n\n<b>Status:</b> {{ $json.activationMessage }}\n<b>Expected Critical:</b> {{ $json.expectedCount }}\n<b>Active Returned:</b> {{ $json.activeCount }}\n{{ $json.hasDeactivated ? '<b>Inactive:</b>\\n' + $json.deactivatedUrls.map(u => '\u2022 <a href=\"' + u + '\">' + u + '</a>').join('\\n') : '' }}\n\n<b>Timestamp:</b> {{ $now.setZone('Asia/Manila').toFormat('MMM dd, yyyy, HH:mm:ss') }}",
-        "additionalFields": { "parse_mode": "HTML" }
+        "text": "=\u26A0\uFE0F <b>WORKFLOW ACTIVATION CHECK</b>\n\n{{ $json.activationUncertain ? 'Activation check is uncertain. No workflow is being declared inactive from this result.' : 'One or more critical workflows appear inactive.' }}\n\n<b>Status:</b> {{ $json.activationMessage }}\n<b>Expected Critical:</b> {{ $json.expectedCount }}\n<b>Active Returned:</b> {{ $json.activeCount }}\n{{ $json.hasDeactivated ? '<b>Inactive:</b>\\n' + $json.deactivatedUrls.map(u => '\u2022 \"'').join('\\n') : '' }}\n\n<b>Timestamp:</b> {{ $now.setZone('Asia/Manila').toFormat('MMM dd, yyyy, HH:mm:ss') }}",
+        "additionalFields": { "parse_mode": "HTML", "disable_web_page_preview": true }
       },
       "id": "tg-activation-alert-v1l",
       "name": "Telegram (Activation Alert)",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.1,
-      "position": [3500, 650],
+      "position": [2550, 500],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "const crypto = require('crypto');\n\nfunction htmlEscape(text) {\n  return String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nfunction truncateRaw(text, max) {\n  var value = String(text || '');\n  return value.length <= max ? value : value.slice(0, max - 1) + '…';\n}\n\nfunction clampTelegramHtml(text, max) {\n  max = max || 3900;\n  var value = String(text || '');\n  if (value.length <= max) return value;\n  var note = '\n\n⚠️ <i>Message truncated</i>';\n  return value.substring(0, max - note.length) + note;\n}\n\nconst statusItem = (() => {\n  try { return $('System Status').first().json || {}; } catch(e) { return {}; }\n})();\nconst activationItem = (() => {\n  try { return $('Detect Activation State').first().json || {}; } catch(e) { return {}; }\n})();\nconst dmsItem = (() => {\n  try { return $('Check DMS Result').first().json || {}; } catch(e) { return {}; }\n})();\nconst orphanItem = (() => {\n  try { return $('Detect Orphans').first().json || {}; } catch(e) { return {}; }\n})();\nconst staticData = $getWorkflowStaticData('global');\n\nconst isDbError = !!(statusItem.error && typeof statusItem.error === 'object' && statusItem.error.message);\nconst cs = isDbError ? 'unknown' : (statusItem.circuit_status || 'unknown');\nconst ec = isDbError ? 0 : (parseInt(statusItem.error_count, 10) || 0);\nconst errHour = isDbError ? 0 : (parseInt(statusItem.errors_last_hour, 10) || 0);\nconst err24h = isDbError ? 0 : (parseInt(statusItem.errors_last_24h, 10) || 0);\nconst lastHeartbeatAt = statusItem.last_heartbeat_at || null;\n\nlet topSources = [];\ntry {\n  const raw = statusItem.top_error_sources;\n  if (typeof raw === 'string') topSources = JSON.parse(raw);\n  else if (Array.isArray(raw)) topSources = raw;\n} catch(e) { topSources = []; }\n\nconst circuitIcon = cs === 'closed' ? '🟢' : cs === 'half_open' ? '🟡' : cs === 'open' ? '🔴' : '⚪';\n\nconst dmsFiredThisCycle = dmsItem.dmsFiredThisCycle || false;\nconst cachedCount = (staticData.eventFailures && staticData.eventFailures.length) || 0;\nconst droppedCount = staticData.droppedCacheCount || 0;\n\nvar hasOrphans = orphanItem.hasOrphans || false;\nvar orphanCount = orphanItem.orphanCount || 0;\nvar orphanState = orphanItem.orphanState || 'unknown';\n\nvar isDegraded = isDbError || cs === 'open' || cs === 'half_open' || cachedCount > 0\n  || !!staticData.lastDeadMansSwitchFailure || orphanState === 'uncertain'\n  || !!staticData.activationCheckUncertain || !!activationItem.hasDeactivated\n  || hasOrphans;\n\nvar isCritical = isDbError || cs === 'open';\nvar previousVerdict = staticData.lastVerdict || 'HEALTHY';\nvar currentVerdict = isCritical ? 'CRITICAL' : isDegraded ? 'DEGRADED' : 'HEALTHY';\nvar isRecovery = previousVerdict !== 'HEALTHY' && currentVerdict === 'HEALTHY';\n\nvar recoveryDetails = [];\nif (isRecovery && staticData.lastDegradedReasons) {\n  var prev = staticData.lastDegradedReasons;\n  if (prev.circuitOpen && cs === 'closed') recoveryDetails.push('circuit closed');\n  if (prev.dmsFailure && !staticData.lastDeadMansSwitchFailure) recoveryDetails.push('DMS restored');\n  if (prev.activationIssue && !activationItem.activationIssue) recoveryDetails.push('workflows reactivated');\n  if (prev.dbError && !isDbError) recoveryDetails.push('database reconnected');\n  if (prev.cachedFailures && cachedCount === 0) recoveryDetails.push('cache cleared');\n  if (prev.hasOrphans && !hasOrphans) recoveryDetails.push('orphans resolved');\n}\n\nif (isDegraded) {\n  staticData.lastDegradedReasons = {\n    circuitOpen: cs === 'open',\n    dmsFailure: !!staticData.lastDeadMansSwitchFailure,\n    activationIssue: !!activationItem.activationIssue,\n    dbError: isDbError,\n    cachedFailures: cachedCount > 0,\n    hasOrphans: hasOrphans\n  };\n} else {\n  delete staticData.lastDegradedReasons;\n}\n\nstaticData.lastVerdict = currentVerdict;\n\nconst verdict = isCritical ? '🔴 CRITICAL' : isDegraded ? '🟡 DEGRADED' : '🟢 HEALTHY';\n\nlet topSourcesLine = '';\nif (topSources.length > 0) {\n  topSourcesLine = '\n\n🏆 <b>Top Sources (24h):</b>';\n  topSources.forEach(function(src, i) {\n    topSourcesLine += '\n' + (i + 1) + '. ' + htmlEscape(truncateRaw(src.workflow_name, 100)) + ' — ' + src.error_count + ' errors' + (src.errors_1h > 0 ? ' (' + src.errors_1h + ' in 1h)' : '');\n  });\n}\n\nconst recoveryBanner = isRecovery\n  ? '✅ <b>RECOVERED</b> — System returned to HEALTHY from ' + previousVerdict\n    + (recoveryDetails.length > 0 ? ' (' + recoveryDetails.join(', ') + ')' : '')\n    + '\n\n'\n  : '';\n\nlet orphanIcon = orphanState === 'found' ? '🔴'\n  : orphanState === 'uncertain' ? '🟡'\n  : orphanState === 'api_error' ? '🔴'\n  : orphanState === 'none' ? '🟢'\n  : '⚪';\n\nlet orphanText = orphanState === 'found' ? orphanCount + ' detected'\n  : orphanState === 'uncertain' ? 'uncertain'\n  : orphanState === 'api_error' ? 'API unreachable'\n  : orphanState === 'none' ? 'none'\n  : 'unknown';\n\nlet emergencyNote = '';\nif (cachedCount > 0) {\n  emergencyNote = '\n🚨 <b>Heartbeat Local Cache:</b> ' + cachedCount + ' failed event(s)';\n  if (droppedCount > 0) emergencyNote += ' (' + droppedCount + ' dropped due to overflow)';\n}\n\nlet dmsNote = '';\nif (staticData.lastDeadMansSwitchFailure && !dmsFiredThisCycle) {\n  dmsNote = '\n⚠️ <b>DMS Failure:</b> <code>' + htmlEscape(truncateRaw(String(staticData.lastDeadMansSwitchFailure), 200)) + '</code>';\n}\n\nlet orphanNote = '';\nif (orphanState === 'uncertain') {\n  orphanNote = '\n⚠️ <b>Orphan Uncertain:</b> ' + htmlEscape(truncateRaw(staticData.orphanUncertainty?.reason || '', 200));\n}\n\nlet activationNote = '';\nif (staticData.activationCheckUncertain) {\n  activationNote = '\n⚠️ <b>Activation Uncertain:</b> ' + htmlEscape(truncateRaw(staticData.activationCheckUncertain.reason, 200));\n} else if (activationItem.hasDeactivated) {\n  activationNote = '\n⚠️ <b>Inactive Critical:</b> ' + activationItem.deactivatedUrls.map(u => '<a href=\"' + u + '\">' + u + '</a>').join(', ');\n} else if (activationItem.activationConfigured) {\n  activationNote = '\n✅ <b>Workflows:</b> ' + activationItem.expectedCount + '/' + activationItem.expectedCount + ' active';\n}\n\nconst dbNote = isDbError ? '\n🔴 <b>DATABASE UNREACHABLE</b>' : '';\n\nvar prevHourErrors = staticData.prevCycleErrorsHour || 0;\nvar direction = errHour > prevHourErrors ? '📈' : errHour < prevHourErrors ? '📉' : '➡️';\nstaticData.prevCycleErrorsHour = errHour;\n\nvar trend = errHour >= 3 ? '🔴 spike ' + direction : err24h >= 10 ? '🟡 elevated ' + direction : '🟢 stable';\n\nconst text = recoveryBanner + '💓 <b>SUPERVISOR — ' + verdict + '</b>\n\n'\n  + circuitIcon + ' <b>Circuit:</b> ' + cs + ' (' + ec + '/5)\n'\n  + (dmsItem.dmsOk ? '🟢' : '🔴') + ' <b>DMS:</b> ' + (dmsItem.dmsOk ? 'ok' : 'FAILED') + '\n'\n  + (activationItem.activationConfigured ? (activationItem.activationIssue ? '🔴' : '🟢') + ' <b>Workflows:</b> ' + (activationItem.activationIssue ? activationItem.activationMessage : activationItem.expectedCount + '/' + activationItem.expectedCount + ' active') : '⚪ <b>Workflows:</b> not configured') + '\n'\n  + orphanIcon + ' <b>Orphans:</b> ' + orphanText + '\n'\n  + '📊 <b>Trend:</b> ' + trend + '\n'\n  + '\n<b>Errors:</b> ' + errHour + ' (1h) · ' + err24h + ' (24h)'\n  + topSourcesLine\n  + dbNote + emergencyNote + dmsNote + orphanNote + activationNote\n  + '\n\n<b>Timestamp:</b> ' + new Date().toLocaleString('en-PH', { timeZone: 'Asia/Manila', year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });\n\nconst stableErrHour = Math.floor(errHour / 3) * 3;\nconst stableErr24h = Math.floor(err24h / 5) * 5;\nconst stableTopSources = topSources.map(function(s) {\n  return s.workflow_name + ':' + (Math.floor(s.error_count / 3) * 3);\n}).join(',');\n\nconst hashInput = cs + ':' + ec + ':' + stableErrHour + ':' + stableErr24h + ':' + isDbError + ':' + cachedCount + ':' + droppedCount + ':' + !!staticData.lastDeadMansSwitchFailure + ':' + orphanState + ':' + orphanCount + ':' + !!staticData.activationCheckUncertain + ':' + !!activationItem.hasDeactivated + ':' + (activationItem.deactivatedIds?.join(',') || '') + ':' + stableTopSources;\nconst messageHash = crypto.createHash('md5').update(hashInput).digest('hex');\nconst lastSentHash = staticData.lastHeartbeatHash || '';\nconst isDuplicate = messageHash === lastSentHash;\n\nconst now = new Date();\nconst currentHourKey = now.toISOString().slice(0, 13);\nconst lastHealthyHourSent = staticData.lastHealthyHourSent || '';\n\nlet shouldSend = false;\nlet sendReason = 'suppressed';\n\nif (isDbError) {\n  shouldSend = true;\n  sendReason = 'database_unreachable';\n} else if (isRecovery) {\n  shouldSend = true;\n  sendReason = 'recovery_to_healthy';\n} else if (isDegraded && !isDuplicate) {\n  shouldSend = true;\n  sendReason = 'degraded_state_changed';\n} else if (!isDegraded && now.getMinutes() < 5 && lastHealthyHourSent !== currentHourKey) {\n  shouldSend = true;\n  sendReason = 'hourly_healthy_pulse';\n}\n\nconst finalText = clampTelegramHtml(text);\n\nreturn [{\n  json: {\n    text: finalText,\n    messageHash: messageHash,\n    isDuplicate: isDuplicate,\n    isDegraded: isDegraded,\n    isCritical: isCritical,\n    verdict: verdict,\n    shouldSend: shouldSend,\n    sendReason: sendReason,\n    dbError: isDbError,\n    circuit_status: cs,\n    error_count: ec,\n    errors_last_hour: errHour,\n    errors_last_24h: err24h,\n    emergency_cache_count: cachedCount,\n    dropped_cache_count: droppedCount,\n    dms_failure_active: !!staticData.lastDeadMansSwitchFailure,\n    orphan_uncertain: orphanState === 'uncertain',\n    activation_uncertain: !!staticData.activationCheckUncertain,\n    activation_issue: !!activationItem.activationIssue,\n    activation_deactivated_ids: activationItem.deactivatedIds || [],\n    currentHourKey: currentHourKey\n  }\n}];"
+        "jsCode": "const crypto = require('crypto');\n\nfunction htmlEscape(text) {\n  return String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nfunction truncateRaw(text, max) {\n  var value = String(text || '');\n  return value.length <= max ? value : value.slice(0, max - 1) + '\\u2026';\n}\n\nfunction clampTelegramHtml(value, max) {\n  max = max || 3900;\n  var s = String(value || '');\n  if (s.length <= max) return s;\n  var note = '\\n\\n\\u26A0\\uFE0F <i>Message truncated</i>';\n  return s.substring(0, max - note.length) + note;\n}\n\nfunction formatTimestamp() {\n  return new Date().toLocaleString('en-PH', {\n    timeZone: 'Asia/Manila', year: 'numeric', month: 'short', day: 'numeric',\n    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false\n  });\n}\n\nvar statusItem = (function() { try { return $('System Status').first().json || {}; } catch(e) { return {}; } })();\nvar activationItem = (function() { try { return $('Detect Activation State').first().json || {}; } catch(e) { return {}; } })();\nvar orphanItem = (function() { try { return $('Detect Orphans').first().json || {}; } catch(e) { return {}; } })();\nvar staticData = $getWorkflowStaticData('global');\n\nvar isDbError = !!(statusItem.error && typeof statusItem.error === 'object' && statusItem.error.message);\nvar cs = isDbError ? 'unknown' : (statusItem.circuit_status || 'unknown');\nvar ec = isDbError ? 0 : (parseInt(statusItem.error_count, 10) || 0);\nvar errHour = isDbError ? 0 : (parseInt(statusItem.errors_last_hour, 10) || 0);\nvar err24h = isDbError ? 0 : (parseInt(statusItem.errors_last_24h, 10) || 0);\nvar retries1h = isDbError ? 0 : (parseInt(statusItem.retries_last_hour, 10) || 0);\nvar retries24h = isDbError ? 0 : (parseInt(statusItem.retries_last_24h, 10) || 0);\nvar lastHeartbeatAt = statusItem.last_heartbeat_at || null;\n\nvar hasOrphans = orphanItem.hasOrphans || false;\nvar orphanCount = orphanItem.orphanCount || 0;\nvar orphanState = orphanItem.orphanState || 'unknown';\n\nvar topSources = [];\ntry {\n  var raw = statusItem.top_error_sources;\n  if (typeof raw === 'string') topSources = JSON.parse(raw);\n  else if (Array.isArray(raw)) topSources = raw;\n} catch(e) { topSources = []; }\n\nvar circuitIcon = cs === 'closed' ? '\\u{1F7E2}' : cs === 'half_open' ? '\\u{1F7E1}' : cs === 'open' ? '\\u{1F534}' : '\\u26AA';\n\nvar prevHourErrors = staticData.prevCycleErrorsHour || 0;\nvar direction = errHour > prevHourErrors ? '\\u{1F4C8}' : errHour < prevHourErrors ? '\\u{1F4C9}' : '\\u27A1\\uFE0F';\nstaticData.prevCycleErrorsHour = errHour;\n\nvar trend = errHour >= 3 ? '\\u{1F534} spike ' + direction : err24h >= 10 ? '\\u{1F7E1} elevated ' + direction : '\\u{1F7E2} stable';\n\nvar cachedCount = (staticData.eventFailures && staticData.eventFailures.length) || 0;\nvar droppedCount = staticData.droppedCacheCount || 0;\n\nvar emergencyNote = '';\nif (cachedCount > 0) {\n  emergencyNote = '\\n\\u{1F6A8} <b>Heartbeat Local Cache:</b> ' + cachedCount + ' failed event(s)';\n  if (droppedCount > 0) emergencyNote += ' (' + droppedCount + ' dropped due to overflow)';\n}\n\nvar dmsNote = '';\nif (staticData.lastDeadMansSwitchFailure) {\n  dmsNote = '\\n\\u26A0\\uFE0F <b>DMS Failure:</b> <code>' + htmlEscape(truncateRaw(String(staticData.lastDeadMansSwitchFailure), 200)) + '</code>';\n}\n\nvar orphanIcon = orphanState === 'found' ? '\\u{1F534}' : orphanState === 'uncertain' ? '\\u{1F7E1}' : orphanState === 'api_error' ? '\\u{1F534}' : orphanState === 'none' ? '\\u{1F7E2}' : '\\u26AA';\nvar orphanText = orphanState === 'found' ? orphanCount + ' detected' : orphanState === 'uncertain' ? 'uncertain' : orphanState === 'api_error' ? 'API unreachable' : orphanState === 'none' ? 'none' : 'unknown';\n\nvar activationNote = '';\nif (staticData.activationCheckUncertain) {\n  activationNote = '\\n\\u26A0\\uFE0F <b>Activation Uncertain:</b> ' + htmlEscape(truncateRaw(staticData.activationCheckUncertain.reason, 200));\n} else if (activationItem.hasDeactivated) {\n  activationNote = '\\n\\u26A0\\uFE0F <b>Inactive Critical:</b> ' + activationItem.deactivatedUrls.map(function(u) { return '\"''; }).join(', ');\n} else if (activationItem.activationConfigured) {\n  activationNote = '\\n\\u2705 <b>Workflows:</b> ' + activationItem.expectedCount + '/' + activationItem.expectedCount + ' active';\n}\n\nvar dbNote = isDbError ? '\\n\\u{1F534} <b>DATABASE UNREACHABLE</b>' : '';\n\nvar isDegraded = isDbError || cs === 'open' || cs === 'half_open' || cachedCount > 0 || !!staticData.lastDeadMansSwitchFailure || orphanState === 'uncertain' || orphanState === 'api_error' || !!staticData.activationCheckUncertain || !!activationItem.hasDeactivated || hasOrphans;\nvar isCritical = isDbError || cs === 'open';\nvar currentVerdict = isCritical ? 'CRITICAL' : isDegraded ? 'DEGRADED' : 'HEALTHY';\nvar verdict = isCritical ? '\\u{1F534} CRITICAL' : isDegraded ? '\\u{1F7E1} DEGRADED' : '\\u{1F7E2} HEALTHY';\n\nvar previousVerdict = staticData.lastVerdict || 'HEALTHY';\nvar isRecovery = previousVerdict !== 'HEALTHY' && currentVerdict === 'HEALTHY';\n\nvar recoveryDetails = [];\nif (isRecovery && staticData.lastDegradedReasons) {\n  var prev = staticData.lastDegradedReasons;\n  if (prev.circuitOpen && cs === 'closed') recoveryDetails.push('circuit closed');\n  if (prev.dmsFailure && !staticData.lastDeadMansSwitchFailure) recoveryDetails.push('DMS restored');\n  if (prev.activationIssue && !activationItem.activationIssue) recoveryDetails.push('workflows reactivated');\n  if (prev.dbError && !isDbError) recoveryDetails.push('database reconnected');\n  if (prev.cachedFailures && cachedCount === 0) recoveryDetails.push('cache cleared');\n  if (prev.hasOrphans && !hasOrphans) recoveryDetails.push('orphans resolved');\n}\n\nif (isDegraded) {\n  staticData.lastDegradedReasons = { circuitOpen: cs === 'open', dmsFailure: !!staticData.lastDeadMansSwitchFailure, activationIssue: !!activationItem.activationIssue, dbError: isDbError, cachedFailures: cachedCount > 0, hasOrphans: hasOrphans };\n} else {\n  delete staticData.lastDegradedReasons;\n}\nstaticData.lastVerdict = currentVerdict;\n\nvar topSourcesLine = '';\nif (topSources.length > 0) {\n  topSourcesLine = '\\n\\n\\u{1F3C6} <b>Top Sources (24h):</b>';\n  topSources.forEach(function(src, i) {\n    topSourcesLine += '\\n' + (i + 1) + '. ' + htmlEscape(truncateRaw(src.workflow_name, 60)) + ' \\u2014 ' + src.error_count + ' errors' + (src.errors_1h > 0 ? ' (' + src.errors_1h + ' in 1h)' : '');\n  });\n}\n\nvar recoveryBanner = isRecovery\n  ? '\\u2705 <b>RECOVERED</b> \\u2014 System returned to HEALTHY from ' + previousVerdict + (recoveryDetails.length > 0 ? ' (' + recoveryDetails.join(', ') + ')' : '') + '\\n\\n'\n  : '';\n\nvar text = recoveryBanner + '\\u{1F493} <b>SUPERVISOR \\u2014 ' + verdict + '</b>\\n\\n'\n  + circuitIcon + ' <b>Circuit:</b> ' + cs + ' (' + ec + '/5)\\n'\n  + (staticData.lastDeadMansSwitchFailure ? '\\u{1F534}' : '\\u{1F7E2}') + ' <b>DMS:</b> ' + (staticData.lastDeadMansSwitchFailure ? 'FAILED' : 'ok') + '\\n'\n  + (activationItem.activationConfigured ? (activationItem.activationIssue ? '\\u{1F534}' : '\\u{1F7E2}') + ' <b>Workflows:</b> ' + (activationItem.activationIssue ? activationItem.activationMessage : activationItem.expectedCount + '/' + activationItem.expectedCount + ' active') : '\\u26AA <b>Workflows:</b> not configured') + '\\n'\n  + orphanIcon + ' <b>Orphans:</b> ' + orphanText + '\\n'\n  + '\\u{1F4CA} <b>Trend:</b> ' + trend + '\\n'\n  + '\\u{1F504} <b>Auto-Retries:</b> ' + retries1h + ' (1h) \\u00B7 ' + retries24h + ' (24h)\\n'\n  + '\\n<b>Errors:</b> ' + errHour + ' (1h) \\u00B7 ' + err24h + ' (24h)'\n  + topSourcesLine\n  + dbNote + emergencyNote + dmsNote + activationNote\n  + '\\n\\n<b>Timestamp:</b> ' + formatTimestamp();\n\ntext = clampTelegramHtml(text);\n\nvar stableErrHour = Math.floor(errHour / 3) * 3;\nvar stableErr24h = Math.floor(err24h / 5) * 5;\nvar stableTopSources = topSources.map(function(s) { return s.workflow_name + ':' + (Math.floor(s.error_count / 3) * 3); }).join(',');\n\nvar hashInput = cs + ':' + ec + ':' + stableErrHour + ':' + stableErr24h + ':' + isDbError + ':' + cachedCount + ':' + droppedCount + ':' + !!staticData.lastDeadMansSwitchFailure + ':' + orphanState + ':' + orphanCount + ':' + !!staticData.activationCheckUncertain + ':' + !!activationItem.hasDeactivated + ':' + (activationItem.deactivatedIds?.join(',') || '') + ':' + stableTopSources + ':' + retries1h + ':' + retries24h;\nvar messageHash = crypto.createHash('md5').update(hashInput).digest('hex');\nvar lastSentHash = staticData.lastHeartbeatHash || '';\nvar isDuplicate = messageHash === lastSentHash;\n\nvar now = new Date();\nvar currentHourKey = now.toISOString().slice(0, 13);\nvar lastHealthyHourSent = staticData.lastHealthyHourSent || '';\n\nvar shouldSend = false;\nvar sendReason = 'suppressed';\n\nif (isDbError) { shouldSend = true; sendReason = 'database_unreachable'; }\nelse if (isRecovery) { shouldSend = true; sendReason = 'recovery_to_healthy'; }\nelse if (isDegraded && !isDuplicate) { shouldSend = true; sendReason = 'degraded_state_changed'; }\nelse if (!isDegraded && now.getMinutes() < 5 && lastHealthyHourSent !== currentHourKey) { shouldSend = true; sendReason = 'hourly_healthy_pulse'; }\n\nreturn [{\n  json: {\n    text: text,\n    messageHash: messageHash,\n    isDuplicate: isDuplicate,\n    isDegraded: isDegraded,\n    isCritical: isCritical,\n    verdict: verdict,\n    shouldSend: shouldSend,\n    sendReason: sendReason,\n    dbError: isDbError,\n    circuit_status: cs,\n    error_count: ec,\n    errors_last_hour: errHour,\n    errors_last_24h: err24h,\n    retries_last_hour: retries1h,\n    retries_last_24h: retries24h,\n    emergency_cache_count: cachedCount,\n    dropped_cache_count: droppedCount,\n    dms_failure_active: !!staticData.lastDeadMansSwitchFailure,\n    orphan_state: orphanState,\n    orphan_count: orphanCount,\n    activation_uncertain: !!staticData.activationCheckUncertain,\n    activation_issue: !!activationItem.activationIssue,\n    activation_deactivated_ids: activationItem.deactivatedIds || [],\n    currentHourKey: currentHourKey\n  }\n}];"
       },
       "id": "code-eval-health-v1l",
       "name": "Evaluate System Health",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [3500, 900]
+      "position": [2550, 800]
     },
     {
       "parameters": {
@@ -335,7 +255,7 @@
       "name": "Should Send?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [3750, 900]
+      "position": [2800, 800]
     },
     {
       "parameters": {
@@ -343,14 +263,15 @@
         "text": "={{ $json.text }}",
         "additionalFields": {
           "parse_mode": "HTML",
-          "disable_notification": "={{ !$json.isDegraded }}"
+          "disable_notification": "={{ !$json.isDegraded }}",
+          "disable_web_page_preview": true
         }
       },
       "id": "tg-heartbeat-v1l",
       "name": "Telegram (Heartbeat)",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.1,
-      "position": [4000, 850],
+      "position": [3050, 750],
       "onError": "continueErrorOutput"
     },
     {
@@ -358,52 +279,81 @@
         "operation": "executeQuery",
         "query": "INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, severity, status, payload)\nVALUES (\n  'heartbeat-' || EXTRACT(EPOCH FROM NOW())::INTEGER,\n  'heartbeat',\n  'Heartbeat Monitor',\n  'heartbeat',\n  CASE WHEN ($1::jsonb)->>'isDegraded' = 'true' THEN 'warning' ELSE 'info' END,\n  CASE WHEN ($1::jsonb)->>'isDegraded' = 'true' THEN 'degraded' ELSE 'healthy' END,\n  $1::jsonb\n)",
         "options": {
-          "queryReplacement": "={{ JSON.stringify({ isDegraded: String($json.isDegraded), circuit_status: $json.circuit_status, error_count: $json.error_count, errors_last_hour: $json.errors_last_hour, errors_last_24h: $json.errors_last_24h, sendReason: $json.sendReason, verdict: $json.verdict, emergency_cache_count: $json.emergency_cache_count, dms_failure_active: String($json.dms_failure_active), orphan_uncertain: String($json.orphan_uncertain), activation_uncertain: String($json.activation_uncertain), activation_issue: String($json.activation_issue) }) }}"
+          "queryReplacement": "={{ JSON.stringify({ isDegraded: String($json.isDegraded), circuit_status: $json.circuit_status, error_count: $json.error_count, errors_last_hour: $json.errors_last_hour, errors_last_24h: $json.errors_last_24h, retries_last_hour: $json.retries_last_hour, retries_last_24h: $json.retries_last_24h, sendReason: $json.sendReason, verdict: $json.verdict, emergency_cache_count: $json.emergency_cache_count, dms_failure_active: String($json.dms_failure_active), orphan_state: $json.orphan_state, orphan_count: $json.orphan_count, activation_uncertain: String($json.activation_uncertain), activation_issue: String($json.activation_issue) }) }}"
         }
       },
       "id": "pg-log-heartbeat-v1l",
       "name": "Log Heartbeat Event",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [4250, 850],
+      "position": [3300, 750],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "const staticData = $getWorkflowStaticData('global');\nconst evalData = (() => {\n  try { return $('Evaluate System Health').first().json; } catch(e) { return {}; }\n})();\n\nstaticData.lastHeartbeatHash = evalData.messageHash || '';\n\nif (!evalData.isDegraded && evalData.currentHourKey) {\n  staticData.lastHealthyHourSent = evalData.currentHourKey;\n}\n\nstaticData.eventFailures = [];\nstaticData.droppedCacheCount = 0;\nstaticData.lastSuccessfulHeartbeatAt = new Date().toISOString();\n\nreturn [{ json: { cacheCleared: true, hashUpdated: true, lastSuccessfulHeartbeatAt: staticData.lastSuccessfulHeartbeatAt } }];"
+        "jsCode": "var staticData = $getWorkflowStaticData('global');\nvar evalData = (function() { try { return $('Evaluate System Health').first().json; } catch(e) { return {}; } })();\n\nstaticData.lastHeartbeatHash = evalData.messageHash || '';\n\nif (!evalData.isDegraded && evalData.currentHourKey) {\n  staticData.lastHealthyHourSent = evalData.currentHourKey;\n}\n\nstaticData.eventFailures = [];\nstaticData.droppedCacheCount = 0;\nstaticData.lastSuccessfulHeartbeatAt = new Date().toISOString();\n\nreturn [{ json: { cacheCleared: true, hashUpdated: true } }];"
       },
       "id": "code-clear-cache-v1l",
-      "name": "Clear Emergency Cache",
+      "name": "Clear Local Cache",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [4500, 850]
+      "position": [3550, 750]
     },
     {
       "parameters": {
-        "jsCode": "const staticData = $getWorkflowStaticData('global');\nconst item = $input.first().json || {};\nif (!staticData.eventFailures) staticData.eventFailures = [];\nstaticData.eventFailures.push({\n  timestamp: new Date().toISOString(),\n  traceId: item.traceId || 'unknown',\n  eventType: 'alert_failed',\n  source: 'Heartbeat Monitor',\n  workflowName: 'Heartbeat Monitor',\n  failedNode: item.failedNode || 'unknown',\n  reason: item.error?.message || 'Telegram, Postgres, or HTTP delivery failed — cached in Heartbeat local cache'\n});\nif (staticData.eventFailures.length > 50) {\n  staticData.droppedCacheCount = (staticData.droppedCacheCount || 0) + (staticData.eventFailures.length - 50);\n  staticData.eventFailures = staticData.eventFailures.slice(-50);\n}\nreturn [{ json: { cached: true, count: staticData.eventFailures.length, droppedCacheCount: staticData.droppedCacheCount || 0 } }];"
+        "method": "GET",
+        "url": "={{ $env.HEALTHCHECKS_PING_URL }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "http-dms-complete-v1l",
+      "name": "HTTP (DMS Complete)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3800, 750],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "var item = $input.first().json || {};\nvar staticData = $getWorkflowStaticData('global');\nvar isError = !!(item.error && typeof item.error === 'object' && item.error.message);\nif (isError) {\n  staticData.lastDeadMansSwitchFailure = item.error.message;\n} else {\n  delete staticData.lastDeadMansSwitchFailure;\n}\nreturn [{ json: { dmsFailure: isError, dmsOk: !isError, dmsErrorMessage: isError ? item.error.message : '' } }];"
+      },
+      "id": "code-check-dms-v1l",
+      "name": "Check DMS Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [4050, 750]
+    },
+    {
+      "parameters": {
+        "jsCode": "var staticData = $getWorkflowStaticData('global');\nvar item = $input.first().json || {};\nif (!staticData.eventFailures) staticData.eventFailures = [];\nstaticData.eventFailures.push({\n  timestamp: new Date().toISOString(),\n  traceId: item.traceId || 'unknown',\n  eventType: 'alert_failed',\n  source: 'Heartbeat Monitor',\n  workflowName: 'Heartbeat Monitor',\n  failedNode: item.failedNode || 'unknown',\n  reason: item.error?.message || 'Telegram or Postgres delivery failed — cached in Heartbeat local cache'\n});\nif (staticData.eventFailures.length > 50) {\n  staticData.droppedCacheCount = (staticData.droppedCacheCount || 0) + (staticData.eventFailures.length - 50);\n  staticData.eventFailures = staticData.eventFailures.slice(-50);\n}\nreturn [{ json: { cached: true, count: staticData.eventFailures.length } }];"
       },
       "id": "code-cache-hb-fail-v1l",
       "name": "Cache Alert Failure",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [4250, 500]
+      "position": [3550, 500]
     },
     {
       "parameters": {
-        "content": "## 💓 Heartbeat Monitor V1 Lean (27 exec nodes)\n**5-min schedule → Circuit Reset Probe (with computed fields) → Has Recovery Transition? → System Status → DMS → Orphans (orphanState enum) → Activation (edge-triggered) → Evaluate Health (recovery context, trend direction, silent notifications) → Telegram Heartbeat**\n\n- Circuit Reset Probe builds trace_id and cooldown in SQL\n- Orphan detection uses orphanState enum with clean cross-reference\n- Recovery banner with specific reason details\n- Trend direction indicator (📈/📉/➡️)\n- Silent healthy heartbeats (disable_notification)\n- Manila timezone in alerts\n- truncateRaw → htmlEscape ordering",
-        "width": 520,
-        "height": 320
+        "content": "## \uD83D\uDC93 Heartbeat Monitor V1 Lean (Final Build)\n**Schedule \u2192 DMS Start \u2192 Circuit Reset \u2192 Status \u2192 Orphans \u2192 Activation \u2192 Health Eval \u2192 Heartbeat \u2192 DMS Complete**\n\n**25 executable nodes. 114 approved changes across 10 review cycles.**\n\n- True end-of-run DMS: /start at beginning, success ping after Clear Cache\n- DMS state uses previous-cycle flag from staticData (5-min lag, acceptable)\n- Circuit recovery absorbed into CTE SQL output columns\n- CTE-consolidated System Status with COALESCE defaults + retry counts\n- Orphan path consolidated: API error + orphans unified into single IF\n- Orphan alert memory: first detection + hourly re-alert only\n- Orphan confidence state: none/found/uncertain/api_error\n- API unreachable edge-triggered (hash + 1-hour re-alert)\n- Activation edge-triggered via SHA-1 state hash\n- HEALTHY/DEGRADED/CRITICAL verdict with recovery banner + subsystem context\n- Trend direction arrows + per-workflow top-5 breakdown + retry visibility\n- Hash stability: volatile counters bucketed before hashing\n- Silent healthy heartbeats (disable_notification)\n- Compact HTML links + disabled web page previews\n- Entity-safe truncation everywhere\n- Manila timezone formatting\n- Heartbeat Local Cache (honest labeling, no cross-workflow claims)",
+        "width": 560,
+        "height": 480
       },
       "id": "sticky-info-hb-v1l",
       "name": "Sticky Note",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [0, -30]
+      "position": [0, -80]
     }
   ],
   "connections": {
     "Schedule Trigger": {
-      "main": [[{ "node": "Circuit Reset Probe", "type": "main", "index": 0 }]]
+      "main": [[{ "node": "HTTP (DMS Start)", "type": "main", "index": 0 }]]
+    },
+    "HTTP (DMS Start)": {
+      "main": [
+        [{ "node": "Circuit Reset Probe", "type": "main", "index": 0 }],
+        [{ "node": "Circuit Reset Probe", "type": "main", "index": 0 }]
+      ]
     },
     "Circuit Reset Probe": {
       "main": [
@@ -428,30 +378,9 @@
     },
     "System Status": {
       "main": [
-        [{ "node": "HTTP (DMS Ping)", "type": "main", "index": 0 }],
-        [{ "node": "HTTP (DMS Ping)", "type": "main", "index": 0 }]
-      ]
-    },
-    "HTTP (DMS Ping)": {
-      "main": [
-        [{ "node": "Check DMS Result", "type": "main", "index": 0 }],
-        [{ "node": "Check DMS Result", "type": "main", "index": 0 }]
-      ]
-    },
-    "Check DMS Result": {
-      "main": [[{ "node": "Has DMS Failed?", "type": "main", "index": 0 }]]
-    },
-    "Has DMS Failed?": {
-      "main": [
-        [
-          { "node": "Telegram (DMS Failure)", "type": "main", "index": 0 },
-          { "node": "HTTP (Running Executions)", "type": "main", "index": 0 }
-        ],
+        [{ "node": "HTTP (Running Executions)", "type": "main", "index": 0 }],
         [{ "node": "HTTP (Running Executions)", "type": "main", "index": 0 }]
       ]
-    },
-    "Telegram (DMS Failure)": {
-      "main": [[], [{ "node": "Cache Alert Failure", "type": "main", "index": 0 }]]
     },
     "HTTP (Running Executions)": {
       "main": [
@@ -462,31 +391,22 @@
     "Detect Orphans": {
       "main": [
         [
-          { "node": "Has API Error?", "type": "main", "index": 0 },
+          { "node": "Should Alert Orphans?", "type": "main", "index": 0 },
           { "node": "HTTP (Active Workflows)", "type": "main", "index": 0 }
         ]
       ]
     },
-    "Has API Error?": {
+    "Should Alert Orphans?": {
       "main": [
-        [{ "node": "Telegram (API Error)", "type": "main", "index": 0 }],
-        [{ "node": "Has Orphans?", "type": "main", "index": 0 }]
+        [
+          { "node": "Log Orphans", "type": "main", "index": 0 },
+          { "node": "Telegram (Orphan Alert)", "type": "main", "index": 0 }
+        ],
+        []
       ]
-    },
-    "Telegram (API Error)": {
-      "main": [[], [{ "node": "Cache Alert Failure", "type": "main", "index": 0 }]]
-    },
-    "Has Orphans?": {
-      "main": [[{ "node": "Log Orphans", "type": "main", "index": 0 }], []]
     },
     "Log Orphans": {
-      "main": [
-        [{ "node": "Telegram (Orphan Alert)", "type": "main", "index": 0 }],
-        [
-          { "node": "Telegram (Orphan Alert)", "type": "main", "index": 0 },
-          { "node": "Cache Alert Failure", "type": "main", "index": 0 }
-        ]
-      ]
+      "main": [[], [{ "node": "Cache Alert Failure", "type": "main", "index": 0 }]]
     },
     "Telegram (Orphan Alert)": {
       "main": [[], [{ "node": "Cache Alert Failure", "type": "main", "index": 0 }]]
@@ -525,8 +445,17 @@
     },
     "Log Heartbeat Event": {
       "main": [
-        [{ "node": "Clear Emergency Cache", "type": "main", "index": 0 }],
+        [{ "node": "Clear Local Cache", "type": "main", "index": 0 }],
         [{ "node": "Cache Alert Failure", "type": "main", "index": 0 }]
+      ]
+    },
+    "Clear Local Cache": {
+      "main": [[{ "node": "HTTP (DMS Complete)", "type": "main", "index": 0 }]]
+    },
+    "HTTP (DMS Complete)": {
+      "main": [
+        [{ "node": "Check DMS Result", "type": "main", "index": 0 }],
+        [{ "node": "Check DMS Result", "type": "main", "index": 0 }]
       ]
     }
   },
