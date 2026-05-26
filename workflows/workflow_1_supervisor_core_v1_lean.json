@@ -1,6 +1,6 @@
 {
   "name": "Supervisor Core V1 Lean",
-  "description": "Primary error monitoring workflow with trigger-node fallback, burst count flush, fingerprint occurrence context, delivery-independent logging (v1 position-aware), tag-safe HTML truncation, consolidated staticData cleanup, and 17 executable nodes.",
+  "description": "R22 Supervisor Core with dead output cleanup, heartbeat-only storm lifecycle authority, named storm others, staticData cleanup, and grouped delivery failure UX.",
   "nodes": [
     {
       "parameters": {},
@@ -8,17 +8,23 @@
       "name": "Error Trigger",
       "type": "n8n-nodes-base.errorTrigger",
       "typeVersion": 1,
-      "position": [250, 500]
+      "position": [
+        250,
+        500
+      ]
     },
     {
       "parameters": {
-        "jsCode": "const item = $input.first().json;\nconst staticData = $getWorkflowStaticData('global');\n\nvar MAX_TELEGRAM_ERROR_CHARS = 500;\n\nfunction sanitize(text) {\n  return String(text || '')\n    .replace(/postgres(ql)?:\\/\\/[^\\s]+/gi, '[REDACTED_DB_URL]')\n    .replace(/[A-Za-z0-9_-]{20,}\\.[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{20,}/g, '[REDACTED_TOKEN]')\n    .replace(/(?:key|token|secret|password|apikey)[\\s]*[=:]\\s*\\S+/gi, '[REDACTED_CREDENTIAL]')\n    .replace(/sk-[a-zA-Z0-9]{20,}/g, '[REDACTED_API_KEY]');\n}\n\nfunction htmlEscape(text) {\n  return String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nfunction truncateRaw(text, max) {\n  var value = String(text || '');\n  return value.length <= max ? value : value.slice(0, max - 1) + '\\u2026';\n}\n\nfunction normalizeForFingerprint(message) {\n  return String(message || '')\n    .toLowerCase()\n    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '_uuid_')\n    .replace(/\\b\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}(:\\d+)?\\b/g, '_ip_')\n    .replace(/https?:\\/\\/[^\\s]+/gi, '_url_')\n    .replace(/\\d{4}-\\d{2}-\\d{2}t?\\d{2}:\\d{2}:\\d{2}[^\\s]*/gi, '_timestamp_')\n    .replace(/executions?\\/\\d+/gi, 'executions/_id_')\n    .replace(/\\b\\d{5,}\\b/g, '_num_')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\n\nvar execution = item.execution || {};\nvar trigger = item.trigger || {};\nvar workflow = item.workflow || {};\nvar triggerError = trigger.error || {};\nvar executionError = execution.error || {};\n\nvar executionId = String(execution.id || item.executionId || 'unknown');\nvar workflowName = String(workflow.name || item.workflowName || 'unknown');\nvar workflowId = String(workflow.id || item.workflowId || 'unknown');\n\n// F1: Added triggerError.name to fallback chain\nvar rawError =\n  executionError.message ||\n  executionError.cause?.message ||\n  triggerError.message ||\n  triggerError.cause?.message ||\n  triggerError.name ||\n  item.errorMessage ||\n  'No error message available';\n\nvar failedNode = String(\n  execution.lastNodeExecuted ||\n  executionError.node?.name ||\n  triggerError.node?.name ||\n  item.failedNode ||\n  'trigger_or_unknown'\n);\n\nvar baseUrl = $env.N8N_BASE_URL || 'http://localhost:5678';\nvar executionUrl = execution.url || (executionId !== 'unknown' ? baseUrl + '/executions/' + executionId : baseUrl + '/executions');\nvar retryOf = execution.retryOf || item.retryOf || null;\nvar executionMode = execution.mode || trigger.mode || item.mode || 'unknown';\n\nvar msg = String(rawError || '').toLowerCase();\n\nvar category = /credentials|credential|auth|unauthorized|forbidden|401|403/.test(msg)\n  ? 'auth'\n  : /rate.?limit|429|quota/.test(msg)\n    ? 'rate_limit'\n    : /timeout|etimedout|504/.test(msg)\n      ? 'timeout'\n      : /econnrefused|enotfound|econnreset|network|502|503/.test(msg)\n        ? 'connectivity'\n        : /cannot read prop|undefined|null|typeerror|referenceerror|syntaxerror/.test(msg)\n          ? 'code_bug'\n          : /memory|heap|out of memory/.test(msg)\n            ? 'resource'\n            : 'unknown';\n\nvar severity = category === 'auth'\n  ? 'critical'\n  : ['rate_limit', 'timeout', 'connectivity', 'resource'].includes(category)\n    ? 'warning'\n    : 'error';\n\nvar severityIcon = severity === 'critical' ? '\\ud83d\\udd34' : severity === 'warning' ? '\\ud83d\\udfe1' : '\\ud83d\\udfe0';\nvar errorMessage = sanitize(rawError).substring(0, 1000);\nvar retryable = ['connectivity', 'rate_limit', 'timeout'].includes(category) && !retryOf && !(/credentials|credential|auth|unauthorized|forbidden|401|403/i.test(rawError));\n\nvar retryNote = retryable\n  ? 'auto-retry eligible (' + category + ')'\n  : retryOf\n    ? 'not retryable (already a retry execution)'\n    : 'not retryable (' + category + ' category)';\n\nvar categoryLabel = category.replace(/_/g, ' ');\nvar normalizedError = normalizeForFingerprint(errorMessage);\nvar htmlError = htmlEscape(truncateRaw(errorMessage, MAX_TELEGRAM_ERROR_CHARS));\nvar telegramSafeError = htmlEscape(truncateRaw(errorMessage, 300));\n\nvar now = Date.now();\nvar traceId = 'err-' + executionId + '-' + now;\nvar fingerprint = (workflowName + '::' + failedNode + '::' + normalizedError.substring(0, 200))\n  .toLowerCase()\n  .replace(/[^a-z0-9:_]/g, '_')\n  .substring(0, 250);\n\nvar fingerprintShort = fingerprint.slice(0, 10);\n\n// \u2500\u2500 GPT-1: Burst count flush fix \u2500\u2500\nvar debounceKey = 'debounce_' + fingerprint;\nvar burstKey = 'burst_' + fingerprint;\nvar lastSeen = staticData[debounceKey] || 0;\nvar isDebounced = (now - lastSeen) < 30000;\n\nvar previousBurstSuppressedCount = staticData[burstKey] || 0;\nvar burstSuppressedCount;\n\nif (isDebounced) {\n  burstSuppressedCount = previousBurstSuppressedCount + 1;\n  staticData[burstKey] = burstSuppressedCount;\n} else {\n  burstSuppressedCount = previousBurstSuppressedCount;\n  staticData[debounceKey] = now;\n  staticData[burstKey] = 0;\n}\n\n// \u2500\u2500 Self-loop detection \u2500\u2500\nvar MONITORING_WORKFLOW_IDS = [\n  $env.SUPERVISOR_WORKFLOW_ID || '',\n  $env.HEARTBEAT_WORKFLOW_ID || '',\n  $env.RETENTION_WORKFLOW_ID || ''\n].filter(Boolean).map(String);\n\nvar monitoringNames = ['supervisor core', 'heartbeat monitor', 'data retention'];\n\nvar isSelfLoop = MONITORING_WORKFLOW_IDS.includes(String(workflowId)) ||\n  monitoringNames.some(function(n) { return String(workflowName || '').toLowerCase().indexOf(n) !== -1; });\n\n// \u2500\u2500 Self-loop Telegram throttle (15-min per fingerprint) \u2500\u2500\nvar selfLoopThrottled = false;\nif (isSelfLoop) {\n  var selfLoopKey = 'self_loop_alert_' + fingerprint;\n  var lastSelfLoopAlert = staticData[selfLoopKey] || 0;\n  selfLoopThrottled = (now - lastSelfLoopAlert) < 900000;\n  if (!selfLoopThrottled) {\n    staticData[selfLoopKey] = now;\n  }\n}\n\n// \u2500\u2500 Fingerprint novelty markers \u2500\u2500\nvar noveltyKey = 'fp_seen_' + fingerprint;\nvar fpMeta = staticData[noveltyKey];\nvar noveltyMarker = '';\n\nif (!fpMeta) {\n  noveltyMarker = 'new';\n  staticData[noveltyKey] = { firstSeen: now, lastSeen: now };\n} else if ((now - fpMeta.lastSeen) > 86400000) {\n  noveltyMarker = 'recurring';\n  fpMeta.lastSeen = now;\n} else {\n  fpMeta.lastSeen = now;\n}\n\n// \u2500\u2500 L1: Consolidated staticData cleanup (single pass) \u2500\u2500\nvar allKeys = Object.keys(staticData);\nfor (var ci = 0; ci < allKeys.length; ci++) {\n  var ck = allKeys[ci];\n  if (ck.startsWith('debounce_') && (now - staticData[ck]) > 300000) {\n    delete staticData[ck];\n    var bk = 'burst_' + ck.slice(9);\n    if (staticData[bk] !== undefined) delete staticData[bk];\n  } else if (ck.startsWith('burst_') && staticData['debounce_' + ck.slice(6)] === undefined) {\n    delete staticData[ck];\n  } else if (ck.startsWith('self_loop_alert_') && (now - staticData[ck]) > 3600000) {\n    delete staticData[ck];\n  } else if (ck.startsWith('fp_seen_') && staticData[ck].lastSeen && (now - staticData[ck].lastSeen) > 604800000) {\n    delete staticData[ck];\n  } else if (ck.startsWith('retry_') && ck.endsWith('_meta')) {\n    var rm = staticData[ck];\n    if (rm && rm.firstSeen && (now - rm.firstSeen) > 3600000) delete staticData[ck];\n  }\n}\n\nreturn [{\n  json: {\n    executionId: executionId,\n    workflowName: workflowName,\n    workflowId: workflowId,\n    errorMessage: errorMessage,\n    normalizedError: normalizedError,\n    htmlError: htmlError,\n    telegramSafeError: telegramSafeError,\n    failedNode: failedNode,\n    executionUrl: executionUrl,\n    severity: severity,\n    severityIcon: severityIcon,\n    category: category,\n    categoryLabel: categoryLabel,\n    retryable: retryable,\n    retryOf: retryOf,\n    retryNote: retryNote,\n    executionMode: executionMode,\n    traceId: traceId,\n    fingerprint: fingerprint,\n    fingerprintShort: fingerprintShort,\n    isDebounced: isDebounced,\n    burstSuppressedCount: burstSuppressedCount,\n    isSelfLoop: isSelfLoop,\n    selfLoopThrottled: selfLoopThrottled,\n    noveltyMarker: noveltyMarker,\n    workflow_version: 'v1_lean'\n  }\n}];"
+        "jsCode": "const item = $input.first().json || {};\nconst sd = $getWorkflowStaticData('global');\nfunction esc(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}\nfunction attr(t){return String(t||'').replace(/&/g,'&amp;').replace(/\"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}\nfunction link(label,url){return url?'<a href=\"'+attr(url)+'\">'+esc(label)+'</a>':'unavailable'}\nfunction sanitize(s){return String(s||'').replace(/postgres(ql)?:\\/\\/[^\\s]+/gi,'[REDACTED_DB_URL]').replace(/\\bBearer\\s+[A-Za-z0-9._~+\\/=-]{20,}/gi,'Bearer [REDACTED_TOKEN]').replace(/(?:key|token|secret|password|apikey|api_key)\\s*[=:]\\s*\\S+/gi,'[REDACTED_CREDENTIAL]').replace(/sk-[A-Za-z0-9_-]{20,}/g,'[REDACTED_API_KEY]')}\nfunction norm(s){return String(s||'').toLowerCase().replace(/https?:\\/\\/[^\\s]+/g,'_url_').replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi,'_uuid_').replace(/\\b\\d{5,}\\b/g,'_num_').replace(/\\s+/g,' ').trim()}\nconst execution=item.execution||{}, trigger=item.trigger||{}, workflow=item.workflow||{};\nconst executionId=String(execution.id||item.executionId||'unknown');\nconst workflowName=String(workflow.name||item.workflowName||'unknown');\nconst workflowId=String(workflow.id||item.workflowId||'unknown');\nconst rawError=execution.error?.message||execution.error?.cause?.message||trigger.error?.message||trigger.error?.cause?.message||trigger.error?.name||item.errorMessage||'No error message available';\nconst failedNode=String(execution.lastNodeExecuted||execution.error?.node?.name||trigger.error?.node?.name||item.failedNode||'trigger_or_unknown');\nconst base=$env.N8N_BASE_URL||'http://localhost:5678';\nlet executionUrl=execution.url||(executionId!=='unknown'?base+'/executions/'+executionId:base+'/executions'); if(executionUrl&&!/^https?:\\/\\//i.test(executionUrl)) executionUrl=base+'/executions';\nconst retryOf=execution.retryOf||item.retryOf||null;\nconst msg=String(rawError||'').toLowerCase();\nlet category='unknown';\nif(/credential|auth|unauthorized|forbidden|401|403/.test(msg)) category='auth';\nelse if(/rate.?limit|429|quota/.test(msg)) category='rate_limit';\nelse if(/timeout|etimedout|504/.test(msg)) category='timeout';\nelse if(/econnrefused|enotfound|econnreset|network|502|503/.test(msg)) category='connectivity';\nelse if(/cannot read prop|undefined|null|typeerror|referenceerror|syntaxerror/.test(msg)) category='code_bug';\nelse if(/memory|heap|out of memory/.test(msg)) category='resource';\nconst severity=category==='auth'?'critical':['rate_limit','timeout','connectivity','resource'].includes(category)?'warning':'error';\nconst severityIcon=severity==='critical'?'🔴':severity==='warning'?'🟡':'🟠';\nconst errorMessage=sanitize(rawError).slice(0,1000);\nconst normalizedError=norm(errorMessage);\nconst htmlError=esc(errorMessage.slice(0,500));\nconst telegramSafeError=esc(errorMessage.slice(0,300));\nconst retryable=['connectivity','rate_limit','timeout'].includes(category)&&!retryOf&&!/credential|auth|unauthorized|forbidden|401|403/i.test(rawError);\nconst now=Date.now();\nconst traceId='err-'+executionId+'-'+now;\nconst fingerprint=(workflowName+'::'+failedNode+'::'+normalizedError.slice(0,200)).toLowerCase().replace(/[^a-z0-9:_]/g,'_').slice(0,250);\nconst fingerprintShort=fingerprint.slice(0,10);\nconst lastSeen=sd['debounce_'+fingerprint]||0;\nconst isDebounced=(now-lastSeen)<30000;\nconst burstKey='burst_'+fingerprint;\nlet burstSuppressedCount=sd[burstKey]||0;\nif(isDebounced){burstSuppressedCount++;sd[burstKey]=burstSuppressedCount;}else{sd['debounce_'+fingerprint]=now;sd[burstKey]=0;}\nconst monitorIds=[$env.SUPERVISOR_WORKFLOW_ID||'', $env.HEARTBEAT_WORKFLOW_ID||'', $env.RETENTION_WORKFLOW_ID||''].filter(Boolean).map(String);\nconst isSelfLoop=monitorIds.includes(String(workflowId))||['supervisor core','heartbeat monitor','data retention'].some(n=>workflowName.toLowerCase().includes(n));\nlet selfLoopThrottled=false;if(isSelfLoop){const k='self_loop_alert_'+fingerprint;selfLoopThrottled=(now-(sd[k]||0))<900000;if(!selfLoopThrottled)sd[k]=now;}\nlet recentFps=sd.recentDistinctFps||[];recentFps=recentFps.filter(e=>e&&(now-e.t)<300000);\n// R22: self-loop errors stay out of storm detection; only fn is stored for failed-node context.\nif(!isDebounced && !isSelfLoop && !recentFps.some(e=>e.fp===fingerprint)) recentFps.push({fp:fingerprint,t:now,wf:workflowName,cat:category,fn:failedNode});\nsd.recentDistinctFps=recentFps.slice(-20);\nconst isStormCondition=recentFps.length>=3, stormDistinctCount=recentFps.length;\nconst wfCounts={}, catCounts={};recentFps.forEach(e=>{if(e.wf)wfCounts[e.wf]=(wfCounts[e.wf]||0)+1;if(e.cat)catCounts[e.cat]=(catCounts[e.cat]||0)+1});\nfunction top(o){const k=Object.keys(o);if(!k.length)return '';k.sort((a,b)=>o[b]-o[a]);return k[0]+' x'+o[k[0]]}\nconst stormDominantWorkflow=top(wfCounts), stormDominantCategory=top(catCounts), stormOtherWorkflowCount=Math.max(0,Object.keys(wfCounts).length-1);\nconst stormSample=recentFps.slice(-3).map(e=>({workflowName:e.wf||'unknown',failedNode:e.fn||'unknown',category:e.cat||'unknown'}));\n// R22: Core only reports active storm context. Heartbeat owns storm lifecycle/resolution.\nlet selfLoopAlertText='';\nif(isSelfLoop&&!selfLoopThrottled) selfLoopAlertText='🔁 <b>SELF-LOOP DETECTED</b>\\n\\n<b>Workflow:</b> '+esc(workflowName)+'\\n<b>Failed Node:</b> '+esc(failedNode)+'\\n<b>Category:</b> '+category+'\\n<b>Error:</b> <code>'+telegramSafeError+'</code>\\n<b>Execution:</b> '+link(executionId,executionUrl)+'\\n<b>Trace:</b> <code>'+traceId+'</code>\\n\\n⚠️ Suppressed before debounce/circuit to prevent monitoring failures from poisoning the main circuit.';\nObject.keys(sd).forEach(k=>{\n  if(k.startsWith('debounce_')&&(now-sd[k])>300000){delete sd[k];const bk='burst_'+k.slice(9);if(sd[bk]!==undefined)delete sd[bk];}\n  else if(k.startsWith('burst_') && (!sd['debounce_'+k.slice(6)] || (now-(sd['debounce_'+k.slice(6)]||0))>300000)) delete sd[k];\n  else if(k.startsWith('self_loop_alert_')&&(now-sd[k])>3600000)delete sd[k];\n  else if(k.startsWith('retry_')&&k.endsWith('_meta')&&sd[k]?.firstSeen&&(now-sd[k].firstSeen)>3600000)delete sd[k];\n});\nreturn [{json:{executionId,workflowName,workflowId,errorMessage,htmlError,telegramSafeError,failedNode,executionUrl,severity,severityIcon,category,categoryLabel:category.replace(/_/g,' '),retryable,retryOf,retryNote:retryable?'retryable transient category ('+category+')':'not retryable',traceId,fingerprint,fingerprintShort,isDebounced,burstSuppressedCount,isSelfLoop,selfLoopThrottled,selfLoopAlertText,isStormCondition,stormDistinctCount,stormDominantCategory,stormDominantWorkflow,stormOtherWorkflowCount,stormSample,noveltyMarker:''}}];"
       },
       "id": "code-enrich-classify-v1l",
-      "name": "Enrich & Classify",
+      "name": "Enrich &amp; Classify",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [500, 500]
+      "position": [
+        500,
+        500
+      ]
     },
     {
       "parameters": {
@@ -47,7 +53,10 @@
       "name": "Is Self Loop?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [750, 500]
+      "position": [
+        750,
+        500
+      ]
     },
     {
       "parameters": {
@@ -76,12 +85,15 @@
       "name": "Should Alert Self-Loop?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [1000, 300]
+      "position": [
+        1000,
+        300
+      ]
     },
     {
       "parameters": {
         "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
-        "text": "=\ud83d\udd01 <b>SELF-LOOP DETECTED</b>\n\nThe Supervisor caught an error from its own monitoring workflows.\n\n<b>Workflow:</b> {{ $json.workflowName }}\n<b>Failed Node:</b> {{ $json.failedNode }}\n<b>Category:</b> {{ $json.categoryLabel }}\n<b>Error:</b> <code>{{ $json.telegramSafeError }}</code>\n<b>Execution:</b> <a href=\"{{ $json.executionUrl }}\">{{ $json.executionId }}</a>\n<b>Trace:</b> <code>{{ $json.traceId }}</code>\n<b>Timestamp:</b> {{ $now.setZone('Asia/Manila').toFormat('MMM dd, yyyy, HH:mm:ss') }}\n\n\u26a0\ufe0f Suppressed before debounce/circuit to prevent monitoring failures from poisoning the main circuit.",
+        "text": "={{ $json.selfLoopAlertText }}",
         "additionalFields": {
           "parse_mode": "HTML",
           "disable_web_page_preview": true
@@ -91,22 +103,28 @@
       "name": "Telegram (Self-Loop Alert)",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.1,
-      "position": [1250, 200],
+      "position": [
+        1250,
+        250
+      ],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, failed_node, severity, status, fingerprint, payload)\nVALUES (\n  ($1::jsonb)->>'traceId',\n  'error_self_loop',\n  ($1::jsonb)->>'workflowName',\n  ($1::jsonb)->>'executionId',\n  ($1::jsonb)->>'failedNode',\n  'warning',\n  'suppressed',\n  ($1::jsonb)->>'fingerprint',\n  jsonb_build_object('reason', 'self_loop_detected', 'category', ($1::jsonb)->>'category', 'executionMode', ($1::jsonb)->>'executionMode', 'selfLoopThrottled', ($1::jsonb)->>'selfLoopThrottled')\n)",
+        "query": "INSERT INTO supervisor_events (trace_id,event_type,workflow_name,execution_id,failed_node,severity,status,fingerprint,payload) VALUES (($1::jsonb)->>'traceId','error_self_loop',($1::jsonb)->>'workflowName',($1::jsonb)->>'executionId',($1::jsonb)->>'failedNode','warning','suppressed',($1::jsonb)->>'fingerprint',$1::jsonb)",
         "options": {
-          "queryReplacement": "={{ JSON.stringify({ traceId: $json.traceId, workflowName: $json.workflowName, executionId: $json.executionId, failedNode: $json.failedNode, fingerprint: $json.fingerprint, category: $json.category, executionMode: $json.executionMode, selfLoopThrottled: String($json.selfLoopThrottled) }) }}"
+          "queryReplacement": "={{ JSON.stringify($json) }}"
         }
       },
       "id": "pg-log-self-loop-v1l",
       "name": "Log Self-Loop Event",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [1000, 500],
+      "position": [
+        1250,
+        100
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -136,27 +154,33 @@
       "name": "Is Debounced?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [1000, 700]
+      "position": [
+        1000,
+        700
+      ]
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, failed_node, severity, status, fingerprint, payload)\nVALUES (\n  ($1::jsonb)->>'traceId',\n  'error_debounced',\n  ($1::jsonb)->>'workflowName',\n  ($1::jsonb)->>'executionId',\n  ($1::jsonb)->>'failedNode',\n  'info',\n  'suppressed',\n  ($1::jsonb)->>'fingerprint',\n  jsonb_build_object('reason', '30s debounce window', 'burstSuppressedCount', (($1::jsonb)->>'burstSuppressedCount')::integer, 'category', ($1::jsonb)->>'category')\n)",
+        "query": "INSERT INTO supervisor_events (trace_id,event_type,workflow_name,execution_id,failed_node,severity,status,fingerprint,payload) VALUES (($1::jsonb)->>'traceId','error_debounced',($1::jsonb)->>'workflowName',($1::jsonb)->>'executionId',($1::jsonb)->>'failedNode','info','suppressed',($1::jsonb)->>'fingerprint',$1::jsonb)",
         "options": {
-          "queryReplacement": "={{ JSON.stringify({ traceId: $json.traceId, workflowName: $json.workflowName, executionId: $json.executionId, failedNode: $json.failedNode, fingerprint: $json.fingerprint, burstSuppressedCount: $json.burstSuppressedCount, category: $json.category }) }}"
+          "queryReplacement": "={{ JSON.stringify($json) }}"
         }
       },
       "id": "pg-log-debounced-v1l",
       "name": "Log Debounced Event",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [1250, 600],
+      "position": [
+        1250,
+        600
+      ],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH current AS (\n  SELECT status, error_count, opened_at, last_error_at\n  FROM circuit_state\n  WHERE circuit_key = 'supervisor'\n  FOR UPDATE\n),\nupserted AS (\n  INSERT INTO circuit_state (circuit_key, status, error_count, last_error_at, updated_at)\n  VALUES ('supervisor', 'closed', 1, NOW(), NOW())\n  ON CONFLICT (circuit_key) DO UPDATE SET\n    error_count = CASE\n      WHEN circuit_state.status = 'closed'\n        AND circuit_state.last_error_at < NOW() - INTERVAL '15 minutes'\n        THEN 1\n      WHEN circuit_state.status = 'closed'\n        THEN circuit_state.error_count + 1\n      WHEN circuit_state.status = 'half_open'\n        THEN circuit_state.error_count + 1\n      ELSE circuit_state.error_count\n    END,\n    status = CASE\n      WHEN circuit_state.status = 'closed'\n        AND (CASE WHEN circuit_state.last_error_at < NOW() - INTERVAL '15 minutes' THEN 1 ELSE circuit_state.error_count + 1 END) >= 5\n        THEN 'open'\n      WHEN circuit_state.status = 'half_open'\n        THEN 'open'\n      ELSE circuit_state.status\n    END,\n    opened_at = CASE\n      WHEN circuit_state.status = 'closed'\n        AND (CASE WHEN circuit_state.last_error_at < NOW() - INTERVAL '15 minutes' THEN 1 ELSE circuit_state.error_count + 1 END) >= 5\n        THEN NOW()\n      WHEN circuit_state.status = 'half_open'\n        THEN NOW()\n      ELSE circuit_state.opened_at\n    END,\n    last_error_at = NOW(),\n    updated_at = NOW()\n  RETURNING *\n),\ntransition_log AS (\n  INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, severity, status, fingerprint, payload)\n  SELECT\n    ($1::jsonb)->>'traceId',\n    'circuit_transition',\n    ($1::jsonb)->>'workflowName',\n    ($1::jsonb)->>'executionId',\n    'warning',\n    u.status,\n    ($1::jsonb)->>'fingerprint',\n    jsonb_build_object(\n      'from', c.status,\n      'to', u.status,\n      'error_count', u.error_count,\n      'workflow_name', ($1::jsonb)->>'workflowName',\n      'workflow_id', ($1::jsonb)->>'workflowId',\n      'failed_node', ($1::jsonb)->>'failedNode',\n      'fingerprint', ($1::jsonb)->>'fingerprint',\n      'category', ($1::jsonb)->>'category'\n    )\n  FROM upserted u\n  JOIN current c ON TRUE\n  WHERE c.status IS NOT NULL AND u.status <> c.status\n  RETURNING id\n),\nfp_context AS (\n  SELECT\n    COUNT(*) FILTER (WHERE event_type = 'error_alert' AND fingerprint = ($1::jsonb)->>'fingerprint' AND created_at > NOW() - INTERVAL '24 hours') AS fp_alerts_24h,\n    MAX(created_at) FILTER (WHERE event_type = 'error_alert' AND fingerprint = ($1::jsonb)->>'fingerprint') AS fp_last_alert_at,\n    COUNT(DISTINCT workflow_name) FILTER (WHERE event_type = 'error_alert' AND fingerprint = ($1::jsonb)->>'fingerprint' AND created_at > NOW() - INTERVAL '24 hours') AS fp_workflows_24h\n  FROM supervisor_events\n)\nSELECT\n  u.status,\n  u.error_count,\n  u.opened_at,\n  c.status AS previous_status,\n  c.last_error_at AS previous_last_error_at,\n  EXISTS (SELECT 1 FROM transition_log) AS transition_logged,\n  fp.fp_alerts_24h,\n  fp.fp_last_alert_at,\n  fp.fp_workflows_24h\nFROM upserted u\nLEFT JOIN current c ON TRUE\nCROSS JOIN fp_context fp",
+        "query": "WITH current AS (SELECT status,error_count,opened_at,last_error_at FROM circuit_state WHERE circuit_key='supervisor' FOR UPDATE), upserted AS (INSERT INTO circuit_state (circuit_key,status,error_count,last_error_at,updated_at) VALUES ('supervisor','closed',1,NOW(),NOW()) ON CONFLICT (circuit_key) DO UPDATE SET error_count=CASE WHEN circuit_state.status='closed' AND circuit_state.last_error_at < NOW() - INTERVAL '15 minutes' THEN 1 WHEN circuit_state.status='closed' THEN circuit_state.error_count+1 WHEN circuit_state.status='half_open' THEN circuit_state.error_count+1 ELSE circuit_state.error_count END, status=CASE WHEN circuit_state.status='closed' AND (CASE WHEN circuit_state.last_error_at < NOW() - INTERVAL '15 minutes' THEN 1 ELSE circuit_state.error_count+1 END)>=5 THEN 'open' WHEN circuit_state.status='half_open' AND circuit_state.error_count+1>=2 THEN 'open' WHEN circuit_state.status='half_open' THEN 'half_open' ELSE circuit_state.status END, opened_at=CASE WHEN circuit_state.status='closed' AND (CASE WHEN circuit_state.last_error_at < NOW() - INTERVAL '15 minutes' THEN 1 ELSE circuit_state.error_count+1 END)>=5 THEN NOW() WHEN circuit_state.status='half_open' AND circuit_state.error_count+1>=2 THEN NOW() ELSE circuit_state.opened_at END, half_open_at=CASE WHEN circuit_state.status='half_open' AND circuit_state.error_count+1>=2 THEN NULL ELSE circuit_state.half_open_at END, last_error_at=NOW(), updated_at=NOW() RETURNING *), transition_log AS (INSERT INTO supervisor_events (trace_id,event_type,workflow_name,execution_id,severity,status,fingerprint,payload) SELECT ($1::jsonb)->>'traceId','circuit_transition',($1::jsonb)->>'workflowName',($1::jsonb)->>'executionId','warning',u.status,($1::jsonb)->>'fingerprint',jsonb_build_object('from',c.status,'to',u.status,'error_count',u.error_count,'category',($1::jsonb)->>'category') FROM upserted u JOIN current c ON TRUE WHERE c.status IS NOT NULL AND u.status<>c.status RETURNING id), fp_context AS (SELECT COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS fp_alerts_24h, COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS fp_alerts_1h, MAX(created_at) AS fp_last_alert_at, MIN(created_at) AS fp_first_alert_at, COUNT(DISTINCT workflow_name) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS fp_workflows_24h FROM supervisor_events WHERE event_type='error_alert' AND status='processed' AND fingerprint=($1::jsonb)->>'fingerprint') SELECT u.status,u.error_count,u.opened_at,c.status AS previous_status,c.last_error_at AS previous_last_error_at,EXISTS(SELECT 1 FROM transition_log) AS transition_logged,CASE WHEN c.status='closed' AND u.status='open' THEN 'closed_threshold' WHEN c.status='half_open' AND u.status='open' THEN 'half_open_reopen' ELSE NULL END AS transition_reason,fp.* FROM upserted u LEFT JOIN current c ON TRUE CROSS JOIN fp_context fp",
         "options": {
           "queryReplacement": "={{ JSON.stringify({ traceId: $json.traceId, workflowName: $json.workflowName, executionId: $json.executionId, fingerprint: $json.fingerprint, workflowId: $json.workflowId, failedNode: $json.failedNode, category: $json.category }) }}",
           "alwaysOutputData": true
@@ -166,42 +190,54 @@
       "name": "Atomic Circuit Update",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [1250, 800],
+      "position": [
+        1250,
+        800
+      ],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "const circuitData = $input.first().json || {};\n\nconst errorData = (() => {\n  try { return $('Enrich & Classify').first().json; }\n  catch(e) {\n    try { return $('Is Debounced?').first().json; }\n    catch(e2) { return {}; }\n  }\n})();\n\nconst isDbError = !!(circuitData.error && typeof circuitData.error === 'object' && circuitData.error.message) || !circuitData.status;\nconst status = isDbError ? 'unknown' : String(circuitData.status || 'unknown');\nconst previousStatus = isDbError ? 'unknown' : String(circuitData.previous_status || status);\nconst errorCount = isDbError ? 0 : (parseInt(circuitData.error_count, 10) || 0);\nconst isTransition = !isDbError && !!circuitData.previous_status && status !== previousStatus;\nconst isCircuitOpen = status === 'open';\nconst isNewlyOpen = isTransition && status === 'open';\nconst isCircuitSuppressing = isCircuitOpen && !isNewlyOpen;\n\nif (isCircuitSuppressing) {\n  return [];\n}\n\nreturn [{\n  json: {\n    ...errorData,\n    circuit_status: status,\n    previous_status: previousStatus,\n    error_count: errorCount,\n    previous_last_error_at: circuitData.previous_last_error_at || null,\n    is_transition: isTransition,\n    transition_logged: !!circuitData.transition_logged,\n    is_circuit_open: isCircuitOpen,\n    is_newly_open: isNewlyOpen,\n    is_circuit_suppressing: false,\n    is_db_error: isDbError,\n    db_error_message: circuitData.error?.message || '',\n    fp_alerts_24h: parseInt(circuitData.fp_alerts_24h, 10) || 0,\n    fp_last_alert_at: circuitData.fp_last_alert_at || null,\n    fp_workflows_24h: parseInt(circuitData.fp_workflows_24h, 10) || 0\n  }\n}];"
+        "jsCode": "const c=$input.first().json||{};const e=(()=>{try{return $('Enrich &amp; Classify').first().json}catch(x){return {}}})();\nconst isDbError=!!(c.error&&c.error.message)||!c.status;const status=isDbError?'unknown':String(c.status||'unknown');const previousStatus=isDbError?'unknown':String(c.previous_status||status);const errorCount=isDbError?0:parseInt(c.error_count,10)||0;const isTransition=!isDbError&&!!c.previous_status&&status!==previousStatus;const isCircuitOpen=status==='open';const isNewlyOpen=isTransition&&status==='open';if(isCircuitOpen&&!isNewlyOpen)return [];\nlet noveltyMarker='';if(!c.fp_first_alert_at)noveltyMarker='new';else{const ms=new Date(c.fp_last_alert_at).getTime();if(ms>0&&(Date.now()-ms)>86400000)noveltyMarker='recurring';}\nreturn [{json:{...e,noveltyMarker,circuit_status:status,previous_status:previousStatus,transition_reason:c.transition_reason||'',error_count:errorCount,previous_last_error_at:c.previous_last_error_at||null,is_transition:isTransition,transition_logged:!!c.transition_logged,is_circuit_open:isCircuitOpen,is_newly_open:isNewlyOpen,is_circuit_suppressing:false,is_db_error:isDbError,db_error_message:c.error?.message||'',fp_alerts_24h:parseInt(c.fp_alerts_24h,10)||0,fp_alerts_1h:parseInt(c.fp_alerts_1h,10)||0,fp_last_alert_at:c.fp_last_alert_at||null,fp_first_alert_at:c.fp_first_alert_at||null,fp_workflows_24h:parseInt(c.fp_workflows_24h,10)||0}}];"
       },
       "id": "code-merge-circuit-v1l",
       "name": "Merge Circuit Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1500, 800]
+      "position": [
+        1500,
+        800
+      ]
     },
     {
       "parameters": {
-        "jsCode": "const item = $input.first().json;\n\nfunction htmlEscape(text) {\n  return String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nfunction htmlAttr(text) {\n  return String(text || '').replace(/&/g, '&amp;').replace(/\"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nfunction tgLink(label, url) {\n  if (!url) return 'unavailable';\n  return '<a href=\"' + htmlAttr(url) + '\">' + htmlEscape(label) + '</a>';\n}\n\n// B3+F5: Tag-safe clampTelegramHtml with pop guard\nfunction clampTelegramHtml(value, max) {\n  max = max || 3900;\n  var s = String(value || '');\n  if (s.length <= max) return s;\n  var note = '\\n\\n\\u26a0\\ufe0f <i>Message truncated (exceeded Telegram limit)</i>';\n  var cutPoint = max - note.length;\n  var lastOpenBracket = s.lastIndexOf('<', cutPoint);\n  var lastCloseBracket = s.lastIndexOf('>', cutPoint);\n  if (lastOpenBracket > lastCloseBracket) {\n    cutPoint = lastOpenBracket;\n  }\n  var truncated = s.substring(0, cutPoint);\n  var openTags = [];\n  var tagRegex = /<(\\/?)(b|i|code|a|pre|u|s)\\b[^>]*>/gi;\n  var match;\n  while ((match = tagRegex.exec(truncated)) !== null) {\n    if (match[1] === '/') { if (openTags.length > 0) openTags.pop(); }\n    else { openTags.push(match[2]); }\n  }\n  for (var ti = openTags.length - 1; ti >= 0; ti--) {\n    truncated += '</' + openTags[ti] + '>';\n  }\n  return truncated + note;\n}\n\nfunction formatTimestamp() {\n  return new Date().toLocaleString('en-PH', {\n    timeZone: 'Asia/Manila',\n    year: 'numeric', month: 'short', day: 'numeric',\n    hour: '2-digit', minute: '2-digit', second: '2-digit',\n    hour12: false\n  });\n}\n\nvar adviceMap = {\n  auth: { cause: 'Credential expired, revoked, or permission issue.', action: 'Check credential validity and recent permission changes.' },\n  rate_limit: { cause: 'External API quota or burst threshold reached.', action: 'Confirm provider rate limits; reduce concurrency or increase backoff.' },\n  timeout: { cause: 'Slow dependency or long-running operation.', action: 'Check external service latency and node timeout settings.' },\n  connectivity: { cause: 'Network, DNS, or remote service availability issue.', action: 'Check service status and recent infrastructure changes.' },\n  code_bug: { cause: 'Expression or Code node received unexpected data shape.', action: 'Inspect input payload and add null guards.' },\n  resource: { cause: 'Memory, heap, or platform resource pressure.', action: 'Check execution size, binary data, and container limits.' },\n  unknown: { cause: 'Unclassified failure.', action: 'Open execution and inspect node output.' }\n};\n\nvar advice = adviceMap[item.category] || adviceMap.unknown;\n\nvar circuitBanner = '';\nif (item.is_newly_open) {\n  circuitBanner = '\\ud83d\\udd34 <b>CIRCUIT BREAKER OPENED</b>\\n'\n    + '<b>Threshold:</b> ' + item.error_count + ' of 5\\n'\n    + '<b>Effect:</b> New errors will be suppressed until recovery probe.\\n\\n';\n}\n\n// N1: Novelty prefix on taxonomy label\nvar noveltyPrefix = item.noveltyMarker === 'new' ? '\\ud83c\\udd95 '\n  : item.noveltyMarker === 'recurring' ? '\\ud83d\\udd04 ' : '';\n\nvar taxonomyLabel = noveltyPrefix + 'NEW ERROR';\nif (item.is_newly_open) taxonomyLabel = noveltyPrefix + 'CIRCUIT OPEN';\nelse if (item.burstSuppressedCount > 0) taxonomyLabel = noveltyPrefix + 'BURST UPDATE (+' + item.burstSuppressedCount + ' suppressed)';\nelse if (item.retryOf) taxonomyLabel = noveltyPrefix + 'RETRY FAILED';\n\n// N2: Circuit decay countdown (with NULL guard)\nvar decayNote = '';\nif (item.previous_last_error_at && !item.is_circuit_open && !item.is_db_error) {\n  var lastErrorMs = new Date(item.previous_last_error_at).getTime();\n  if (lastErrorMs > 0) {\n    var decayMs = 900000 - (Date.now() - lastErrorMs);\n    if (decayMs > 0) {\n      var decayMin = Math.ceil(decayMs / 60000);\n      decayNote = ' (decays in ' + decayMin + 'm)';\n    } else {\n      decayNote = ' (decay imminent)';\n    }\n  }\n}\n\nvar circuitLine = item.is_db_error\n  ? 'Circuit: \\u26a0\\ufe0f unknown \\u2014 Postgres unavailable'\n  : 'Circuit: Error ' + item.error_count + ' of 5' + decayNote;\n\nvar burstLine = item.burstSuppressedCount > 0\n  ? '\\n\\u26a1 <b>Suppressed:</b> ' + item.burstSuppressedCount + ' duplicate(s) since last alert'\n  : '';\n\nvar retryLine = item.retryable\n  ? '<b>Retryable:</b> yes \\u2014 auto-retry eligible'\n  : item.retryOf\n    ? '<b>Retryable:</b> no \\u2014 this is already a retry execution'\n    : '<b>Retryable:</b> no (' + item.categoryLabel + ')';\n\nvar executionLink = tgLink('Open execution', item.executionUrl);\n\n// D: Compact fingerprint label\nvar fpLabel = item.fingerprintShort ? ' \\u00b7 fp:' + item.fingerprintShort : '';\n\n// GPT-2: Fingerprint occurrence context (only when prior occurrences exist)\nvar occurrenceLine = '';\nif ((item.fp_alerts_24h || 0) > 0) {\n  occurrenceLine = '\\n<b>Pattern:</b> seen ' + item.fp_alerts_24h + 'x in 24h' + (item.fp_workflows_24h > 1 ? ' across ' + item.fp_workflows_24h + ' workflows' : '');\n}\n\nvar text;\n\nif (item.severity === 'critical') {\n  text = circuitBanner + item.severityIcon + ' <b>' + taxonomyLabel + ' \\u2014 ' + htmlEscape(item.categoryLabel) + fpLabel + '</b>\\n\\n'\n    + '<b>Workflow:</b> ' + htmlEscape(item.workflowName) + '\\n'\n    + '<b>Failed Node:</b> ' + htmlEscape(item.failedNode) + '\\n'\n    + '<b>Category:</b> ' + item.categoryLabel + '\\n'\n    + '<b>Error:</b> <code>' + item.htmlError + '</code>\\n'\n    + '<b>Execution:</b> ' + executionLink + '\\n\\n'\n    + '\\ud83d\\udca1 <b>Likely cause:</b> ' + advice.cause + '\\n'\n    + '\\ud83d\\udd27 <b>Action:</b> ' + advice.action + '\\n\\n'\n    + retryLine + '\\n'\n    + '<b>' + circuitLine + '</b>' + burstLine + occurrenceLine + '\\n\\n'\n    + '<b>Trace:</b> <code>' + item.traceId + '</code>\\n'\n    + '<b>Timestamp:</b> ' + formatTimestamp();\n} else {\n  text = circuitBanner + item.severityIcon + ' <b>' + taxonomyLabel + ' \\u2014 ' + htmlEscape(item.categoryLabel) + fpLabel + '</b>\\n\\n'\n    + '<b>Workflow:</b> ' + htmlEscape(item.workflowName) + ' \\u2192 ' + htmlEscape(item.failedNode) + '\\n'\n    + '<b>Error:</b> <code>' + item.htmlError + '</code>\\n'\n    + '<b>Execution:</b> ' + executionLink + '\\n\\n'\n    + '\\ud83d\\udca1 ' + advice.cause + '\\n'\n    + '\\ud83d\\udd27 ' + advice.action + '\\n\\n'\n    + retryLine + '\\n'\n    + '<b>' + circuitLine + '</b>' + burstLine + occurrenceLine + '\\n\\n'\n    + '<b>Trace:</b> <code>' + item.traceId + '</code>\\n'\n    + '<b>Timestamp:</b> ' + formatTimestamp();\n}\n\ntext = clampTelegramHtml(text);\n\nreturn [{ json: { ...item, alertText: text } }];"
+        "jsCode": "const item=$input.first().json;const sd=$getWorkflowStaticData('global');\nfunction h(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}function a(t){return String(t||'').replace(/&/g,'&amp;').replace(/\"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}function link(l,u){return u?'<a href=\"'+a(u)+'\">'+h(l)+'</a>':'unavailable'}function clamp(s,max=3900){s=String(s||'');if(s.length<=max)return s;const note='\\n\\n⚠️ <i>Message truncated</i>';let cut=max-note.length;const lo=s.lastIndexOf('<',cut),lc=s.lastIndexOf('>',cut);if(lo>lc)cut=lo;let t=s.substring(0,cut),stack=[],re=/<(\\/)?(b|i|code|a|pre|u|s)\\b[^>]{0,200}>/gi,m;while((m=re.exec(t))!==null){if(m[1]){if(stack.length)stack.pop()}else stack.push(m[2])}for(let i=stack.length-1;i>=0;i--)t+='</'+stack[i]+'>';return t+note}\nif(sd.eventFailuresPendingClear&&(sd.eventFailures||[]).length<=(sd.eventFailureCountAtFlag||0)){sd.eventFailures=[];sd.droppedCacheCount=0;delete sd.eventFailuresPendingClear;delete sd.eventFailureCountAtFlag}\nlet deliveryBanner='', cached=sd.eventFailures||[];if(cached.length){const counts={};cached.forEach(f=>{counts[f.deliveryKind||'core_delivery_failed']=(counts[f.deliveryKind||'core_delivery_failed']||0)+1});const parts=Object.keys(counts).map(k=>k.replace(/_/g,' ')+': '+counts[k]);const last=cached[cached.length-1]||{};deliveryBanner='⚠️ <b>Supervisor Delivery Degraded</b>\\n• '+parts.join('\\n• ')+'\\n<i>Last source: '+h(last.sourceNode||last.failedNode||'unknown')+'</i>\\n\\n';sd.eventFailuresPendingClear=true;sd.eventFailureCountAtFlag=cached.length;}\nconst rm=sd['retry_'+item.fingerprint+'_meta'];const retryCount=rm?((Date.now()-(rm.firstSeen||0)>3600000)?0:(rm.count||0)):0;const never=String($env.NEVER_RETRY_WORKFLOW_IDS||'').split(',').map(s=>s.trim()).filter(Boolean);const hasExec=item.executionId&&item.executionId!=='unknown'&&/^[A-Za-z0-9_-]+$/.test(String(item.executionId));const allowed=['connectivity','rate_limit','timeout'].includes(item.category);const circuitOk=!item.is_db_error&&item.circuit_status!=='open'&&!item.is_newly_open;const retryGate=item.is_db_error?'db_unavailable':item.isStormCondition?'storm_suppressed':item.is_newly_open?'circuit_opened':item.retryOf?'retry_execution':never.includes(String(item.workflowId))?'workflow_denied':!hasExec?'no_execution_id':retryCount>=2?'budget_exhausted':(item.retryable&&allowed&&circuitOk?'eligible':'not_retryable');\nconst supervisorAction=item.is_newly_open?'Circuit opened; suppressing follow-up noise.':retryGate==='eligible'?'Auto-retry scheduled after backoff.':item.isStormCondition?'Retry suppressed during storm.':item.is_db_error?'DB unavailable; alert sent with degraded control plane.':'Alert logged; awaiting operator review.';\nconst advice={auth:['Credential expired, revoked, or permission issue.','Check credential validity and recent permission changes.'],rate_limit:['External API quota or burst threshold reached.','Confirm provider rate limits; reduce concurrency or increase backoff.'],timeout:['Slow dependency or long-running operation.','Check external service latency and node timeout settings.'],connectivity:['Network, DNS, or remote service availability issue.','Check service status and recent infrastructure changes.'],code_bug:['Expression or Code node received unexpected data shape.','Inspect input payload and add null guards.'],resource:['Memory, heap, or platform resource pressure.','Check execution size, binary data, and container limits.'],unknown:['Unclassified failure.','Open execution and inspect node output.']}[item.category]||['Unclassified failure.','Open execution and inspect node output.'];\nconst reasonLine=item.transition_reason?'<b>Reason:</b> '+h(String(item.transition_reason).replace(/_/g,' '))+'\\n':'';const circuitBanner=item.is_newly_open?'🔴 <b>CIRCUIT BREAKER OPENED</b>\\n<b>Threshold:</b> '+item.error_count+' of 5\\n'+reasonLine+'<b>Effect:</b> New errors suppressed until recovery probe.\\n<b>Recovery probe:</b> ~5-10 min after errors stop (next heartbeat cycle)\\n\\n':'';\nlet stormBanner='';if(item.isStormCondition){const dominant=String(item.stormDominantWorkflow||'mixed').replace(/ x\\d+$/,''),cat=String(item.stormDominantCategory||'mixed').replace(/ x\\d+$/,'');let otherNames='';if(item.stormOtherWorkflowCount>0&&Array.isArray(item.stormSample)){const others=[...new Set(item.stormSample.map(s=>s.workflowName).filter(n=>n&&n!==dominant&&n!=='unknown'))];otherNames=others.length?' + '+others.map(h).join(', '):' + '+item.stormOtherWorkflowCount+' others';}stormBanner='⛈ <b>ERROR STORM — '+item.stormDistinctCount+' distinct errors in 5m</b>\\n📍 <b>'+h(dominant)+'</b> ('+h(cat)+')'+otherNames+'\\n<i>Multiple failures suggest a systemic issue.</i>\\n\\n';}\nconst novelty=item.noveltyMarker==='new'?'🆕 ':item.noveltyMarker==='recurring'?'🔄 ':'';let label=novelty+'NEW ERROR';if(item.is_newly_open)label=novelty+'CIRCUIT OPEN';else if(item.burstSuppressedCount>0)label=novelty+'BURST UPDATE (+'+item.burstSuppressedCount+' suppressed)';else if(item.retryOf)label=novelty+'RETRY FAILED';\nconst retryLine=retryGate==='eligible'?'<b>Retryable:</b> eligible (transient) — subject to budget & circuit':'<b>Retryable:</b> no ('+retryGate.replace(/_/g,' ')+')';const circuitLine=item.is_db_error?'Circuit: ⚠️ unknown — Postgres unavailable':'Circuit: Error '+item.error_count+' of 5'+(!item.is_circuit_open&&!item.is_db_error&&item.circuit_status!=='half_open'&&item.error_count>0?' (resets in ~15m if quiet)':'');\nlet text=deliveryBanner+circuitBanner+stormBanner+item.severityIcon+' <b>'+label+' — '+h(item.categoryLabel)+(item.fingerprintShort?' · fp:'+item.fingerprintShort:'')+'</b>\\n\\n<b>Workflow:</b> '+h(item.workflowName)+' → '+h(item.failedNode)+'\\n<b>Error:</b> <code>'+item.htmlError+'</code>\\n<b>Execution:</b> '+link('Open execution',item.executionUrl)+'\\n\\n💡 '+advice[0]+'\\n🔧 '+advice[1]+'\\n\\n'+retryLine+'\\n🧭 <b>Supervisor:</b> '+h(supervisorAction)+'\\n<b>'+circuitLine+'</b>'+(item.burstSuppressedCount>0?'\\n⚡ <b>Suppressed:</b> '+item.burstSuppressedCount+' duplicate(s) since last alert':'')+'\\n\\n<b>Trace:</b> <code>'+item.traceId+'</code>\\n<b>Timestamp:</b> '+new Date().toLocaleString('en-PH',{timeZone:'Asia/Manila',year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});\nreturn [{json:{...item,retryGate,supervisorAction,alertText:clamp(text)}}];"
       },
       "id": "code-fmt-alert-v1l",
       "name": "Format Alert Message",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1750, 800]
+      "position": [
+        1750,
+        800
+      ]
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, failed_node, severity, status, fingerprint, payload)\nVALUES (\n  ($1::jsonb)->>'traceId',\n  'error_alert',\n  ($1::jsonb)->>'workflowName',\n  ($1::jsonb)->>'executionId',\n  ($1::jsonb)->>'failedNode',\n  ($1::jsonb)->>'severity',\n  'processed',\n  ($1::jsonb)->>'fingerprint',\n  $1::jsonb\n)",
+        "query": "INSERT INTO supervisor_events (trace_id,event_type,workflow_name,execution_id,failed_node,severity,status,fingerprint,payload) VALUES (($1::jsonb)->>'traceId','error_alert',($1::jsonb)->>'workflowName',($1::jsonb)->>'executionId',($1::jsonb)->>'failedNode',($1::jsonb)->>'severity','processed',($1::jsonb)->>'fingerprint',$1::jsonb)",
         "options": {
-          "queryReplacement": "={{ JSON.stringify({ traceId: $json.traceId, workflowName: $json.workflowName, executionId: $json.executionId, failedNode: $json.failedNode, severity: $json.severity, fingerprint: $json.fingerprint, retryable: String($json.retryable), retryOf: $json.retryOf || '', retryNote: $json.retryNote, error_count: $json.error_count, category: $json.category, burstSuppressedCount: $json.burstSuppressedCount, is_db_error: String($json.is_db_error), is_newly_open: String($json.is_newly_open || false), noveltyMarker: $json.noveltyMarker || '', fingerprintShort: $json.fingerprintShort || '', fp_alerts_24h: $json.fp_alerts_24h || 0 }) }}"
+          "queryReplacement": "={{ JSON.stringify({ traceId:$json.traceId, workflowName:$json.workflowName, workflowId:$json.workflowId, executionId:$json.executionId, executionUrl:$json.executionUrl, failedNode:$json.failedNode, errorExcerpt:String($json.errorMessage||'').slice(0,500), severity:$json.severity, fingerprint:$json.fingerprint, retryable:String($json.retryable), retryGate:$json.retryGate, retryOf:$json.retryOf||'', retryNote:$json.retryNote, error_count:$json.error_count, category:$json.category, burstSuppressedCount:$json.burstSuppressedCount, is_db_error:String($json.is_db_error), is_newly_open:String($json.is_newly_open||false), circuit_status:$json.circuit_status||'', previous_status:$json.previous_status||'', transition_reason:$json.transition_reason||'', noveltyMarker:$json.noveltyMarker||'', fingerprintShort:$json.fingerprintShort||'', fp_alerts_24h:$json.fp_alerts_24h||0, fp_alerts_1h:$json.fp_alerts_1h||0, fp_last_alert_at:$json.fp_last_alert_at||'', isStormCondition:String($json.isStormCondition||false), stormDistinctCount:$json.stormDistinctCount||0, stormDominantCategory:$json.stormDominantCategory||'', stormDominantWorkflow:$json.stormDominantWorkflow||'', stormOtherWorkflowCount:$json.stormOtherWorkflowCount||0, stormSample:$json.stormSample||[], supervisorAction:$json.supervisorAction||'' }) }}"
         }
       },
       "id": "pg-log-alert-v1l",
       "name": "Log Alert Event",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [2000, 700],
+      "position": [
+        2000,
+        700
+      ],
       "onError": "continueErrorOutput"
     },
     {
@@ -218,18 +254,24 @@
       "name": "Telegram (Send Alert)",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.1,
-      "position": [2000, 800],
+      "position": [
+        2000,
+        800
+      ],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "const item = $input.first().json;\nconst staticData = $getWorkflowStaticData('global');\n\nvar now = Date.now();\nvar retryKey = 'retry_' + item.fingerprint + '_meta';\nvar retryMeta = staticData[retryKey] || { count: 0, firstSeen: now };\n\nif ((now - retryMeta.firstSeen) > 3600000) {\n  retryMeta.count = 0;\n  retryMeta.firstSeen = now;\n}\n\nvar allowedCategory = ['connectivity', 'rate_limit', 'timeout'].includes(item.category);\nvar isRetryExecution = !!item.retryOf;\nvar belowLimit = retryMeta.count < 2;\nvar hasExecutionId = item.executionId && item.executionId !== 'unknown';\n\nvar NEVER_RETRY_WORKFLOW_IDS = String($env.NEVER_RETRY_WORKFLOW_IDS || '')\n  .split(',')\n  .map(function(s) { return s.trim(); })\n  .filter(Boolean);\nvar retryDeniedByWorkflow = NEVER_RETRY_WORKFLOW_IDS.includes(String(item.workflowId));\n\nvar shouldRetry = !!item.retryable && allowedCategory && !isRetryExecution && belowLimit && hasExecutionId && !retryDeniedByWorkflow;\n\nvar baseDelay = 15;\nvar exponentialDelay = shouldRetry ? Math.min(baseDelay * Math.pow(2, retryMeta.count), 120) : 0;\nvar jitter = shouldRetry ? Math.floor(Math.random() * 5) : 0;\nvar retryDelaySeconds = exponentialDelay + jitter;\n\nif (shouldRetry) {\n  retryMeta.count += 1;\n  retryMeta.lastRetryAt = now;\n  staticData[retryKey] = retryMeta;\n}\n\n// L1: Retry meta cleanup is now consolidated in Enrich & Classify single-pass loop\n\n// F7: IMPORTANT: return [] gates downstream Wait + HTTP nodes.\n// This REQUIRES executionOrder: v1. Under v0, empty returns may propagate null items.\nif (!shouldRetry) {\n  return [];\n}\n\nvar baseUrl = $env.N8N_BASE_URL || 'http://localhost:5678';\nvar retryApiUrl = baseUrl + '/api/v1/executions/' + item.executionId + '/retry';\n\nreturn [{\n  json: {\n    ...item,\n    shouldRetry: true,\n    retryAttempt: retryMeta.count,\n    retryLimit: 2,\n    retryDelaySeconds: retryDelaySeconds,\n    retryApiUrl: retryApiUrl,\n    autoRetryReason: 'retryable transient failure (planned attempt ' + retryMeta.count + '/2, delay ' + retryDelaySeconds + 's)'\n  }\n}];"
+        "jsCode": "const item=$input.first().json;const sd=$getWorkflowStaticData('global');const now=Date.now();if(item.retryGate!=='eligible')return[];const key='retry_'+item.fingerprint+'_meta';let meta=sd[key]||{count:0,firstSeen:now};if(now-meta.firstSeen>3600000)meta={count:0,firstSeen:now};const retryDelaySeconds=Math.min(15*Math.pow(2,meta.count),120)+Math.floor(Math.random()*5);meta.count++;meta.lastRetryAt=now;sd[key]=meta;const base=$env.N8N_BASE_URL||'http://localhost:5678';return[{json:{...item,shouldRetry:true,retryAttempt:meta.count,retryLimit:2,retryDelaySeconds,retryApiUrl:base+'/api/v1/executions/'+item.executionId+'/retry',autoRetryReason:'retryable transient failure (planned attempt '+meta.count+'/2, delay '+retryDelaySeconds+'s)'}}];"
       },
       "id": "code-should-retry-v1l",
       "name": "Should Auto-Retry?",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [2000, 900]
+      "position": [
+        2000,
+        900
+      ]
     },
     {
       "parameters": {
@@ -241,7 +283,10 @@
       "name": "Wait (Backoff)",
       "type": "n8n-nodes-base.wait",
       "typeVersion": 1.1,
-      "position": [2250, 900]
+      "position": [
+        2250,
+        900
+      ]
     },
     {
       "parameters": {
@@ -257,35 +302,57 @@
       "name": "HTTP (Auto-Retry Execution)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [2500, 900],
+      "position": [
+        2500,
+        900
+      ],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, severity, status, fingerprint, payload)\nVALUES (\n  ($1::jsonb)->>'traceId',\n  'error_alert',\n  ($1::jsonb)->>'workflowName',\n  ($1::jsonb)->>'executionId',\n  'info',\n  ($1::jsonb)->>'status',\n  ($1::jsonb)->>'fingerprint',\n  $1::jsonb\n)",
+        "query": "INSERT INTO supervisor_events (trace_id,event_type,workflow_name,execution_id,severity,status,fingerprint,payload) VALUES (($1::jsonb)->>'traceId','error_alert',($1::jsonb)->>'workflowName',($1::jsonb)->>'executionId','info',($1::jsonb)->>'status',($1::jsonb)->>'fingerprint',$1::jsonb)",
         "options": {
-          "queryReplacement": "={{ JSON.stringify({ traceId: $('Should Auto-Retry?').first().json.traceId, workflowName: $('Should Auto-Retry?').first().json.workflowName, executionId: $('Should Auto-Retry?').first().json.executionId, fingerprint: $('Should Auto-Retry?').first().json.fingerprint, status: $json.error ? 'retry_submit_failed' : 'retry_submitted', retryAttempt: $('Should Auto-Retry?').first().json.retryAttempt, retryLimit: $('Should Auto-Retry?').first().json.retryLimit, retryDelaySeconds: $('Should Auto-Retry?').first().json.retryDelaySeconds, category: $('Should Auto-Retry?').first().json.category, autoRetryReason: $('Should Auto-Retry?').first().json.autoRetryReason, httpError: $json.error ? ($json.error.message || 'retry API call failed') : '' }) }}"
+          "queryReplacement": "={{ JSON.stringify({ traceId:$('Should Auto-Retry?').first().json.traceId, workflowName:$('Should Auto-Retry?').first().json.workflowName, executionId:$('Should Auto-Retry?').first().json.executionId, fingerprint:$('Should Auto-Retry?').first().json.fingerprint, status:$json.error?'retry_submit_failed':'retry_submitted', retryGate:$('Should Auto-Retry?').first().json.retryGate||'eligible', retryAttempt:$('Should Auto-Retry?').first().json.retryAttempt, retryLimit:$('Should Auto-Retry?').first().json.retryLimit, retryDelaySeconds:$('Should Auto-Retry?').first().json.retryDelaySeconds, category:$('Should Auto-Retry?').first().json.category, autoRetryReason:$('Should Auto-Retry?').first().json.autoRetryReason, httpError:$json.error?($json.error.message||'retry API call failed'):'' }) }}"
         }
       },
       "id": "pg-log-retry-v1l",
       "name": "Log Auto-Retry Submitted",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [2750, 900],
+      "position": [
+        2750,
+        900
+      ],
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "content": "## \ud83d\udee1\ufe0f Supervisor Core V1 Lean (Round 12 Build)\n**Error Trigger \u2192 Enrich/Classify \u2192 Self-Loop (throttled) \u2192 Debounce \u2192 Circuit \u2192 Alert \u2192 Auto-Retry**\n\n**17 executable nodes. Round 12: +4 bug fixes, +3 novel features, +7 improvements.**\n\n- F1: triggerError.name fallback for trigger-node errors\n- F2+L2: DB log executes before Telegram (v1 canvas position + array order)\n- F5: clampTelegramHtml pop-without-check guard\n- GPT-1: Burst count flush fix (feature was unreachable)\n- GPT-2: Fingerprint occurrence context (seen Nx in 24h, cross-workflow)\n- N1: Fingerprint novelty markers (\ud83c\udd95 NEW / \ud83d\udd04 RECURRING)\n- N2: Circuit decay countdown (previous_last_error_at)\n- D: Compact fingerprint label (fp:XXXXXXXXXX)\n- L1: Consolidated staticData cleanup (single pass, all prefixes)\n- F7: Empty-array return documentation for v1 execution order\n- GPT-S: 'planned attempt' semantic in retry reason\n- Self-loop Telegram throttle (15-min per fingerprint)\n- Auto-retry failure logging (success AND failure via dynamic status)\n- All INSERTs use single-JSON-parameter pattern (immune to comma-split)\n- Tag-safe HTML truncation + tgLink helper\n- Critical/circuit-open alerts buzz phone; others silent",
-        "width": 560,
-        "height": 560
+        "jsCode": "const sd=$getWorkflowStaticData('global');const item=$input.first().json||{};if(!sd.eventFailures)sd.eventFailures=[];const sourceNode=item.node?.name||item.nodeName||item.error?.node?.name||item.failedNode||'unknown_delivery_node';const deliveryKind=sourceNode.includes('Telegram')?'telegram_delivery_failed':(sourceNode.includes('Log')||sourceNode.includes('Postgres'))?'postgres_log_failed':'core_delivery_failed';sd.eventFailures.push({timestamp:new Date().toISOString(),traceId:item.traceId||item.json?.traceId||'unknown',eventType:deliveryKind,deliveryKind,sourceNode,source:'Supervisor Core',workflowName:item.workflowName||item.json?.workflowName||'Supervisor Core',failedNode:sourceNode,reason:(item.error?.message||item.message||deliveryKind)+' at '+sourceNode});if(sd.eventFailures.length>50){sd.droppedCacheCount=(sd.droppedCacheCount||0)+(sd.eventFailures.length-50);sd.eventFailures=sd.eventFailures.slice(-50)}return[{json:{cached:true,count:sd.eventFailures.length,dropped:sd.droppedCacheCount||0,deliveryKind,sourceNode}}];"
+      },
+      "id": "code-cache-core-fail-v1l",
+      "name": "Cache Core Delivery Failure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3000,
+        650
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 🛡️ Supervisor Core V1 Lean (Round 22 Build)\n**18 executable nodes. R22 internal hardening, zero new nodes.**\n\n- R22: dead output fields removed\n- R22: Core storm resolved banner removed; Heartbeat owns storm lifecycle\n- R22: storm others named from stormSample\n- R22: burst/retry staticData cleanup added\n- R22: delivery failure banner grouped by deliveryKind\n- R21: storm failedNode fix, Supervisor Action line, recovery probe estimate",
+        "width": 680,
+        "height": 620
       },
       "id": "sticky-info-v1l",
       "name": "Sticky Note",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [250, 30]
+      "position": [
+        250,
+        30
+      ]
     }
   ],
   "connections": {
@@ -293,14 +360,14 @@
       "main": [
         [
           {
-            "node": "Enrich & Classify",
+            "node": "Enrich &amp; Classify",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Enrich & Classify": {
+    "Enrich &amp; Classify": {
       "main": [
         [
           {
@@ -314,11 +381,6 @@
     "Is Self Loop?": {
       "main": [
         [
-          {
-            "node": "Log Self-Loop Event",
-            "type": "main",
-            "index": 0
-          },
           {
             "node": "Should Alert Self-Loop?",
             "type": "main",
@@ -338,12 +400,41 @@
       "main": [
         [
           {
+            "node": "Log Self-Loop Event",
+            "type": "main",
+            "index": 0
+          },
+          {
             "node": "Telegram (Self-Loop Alert)",
             "type": "main",
             "index": 0
           }
         ],
         []
+      ]
+    },
+    "Telegram (Self-Loop Alert)": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Cache Core Delivery Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Self-Loop Event": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Cache Core Delivery Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Is Debounced?": {
@@ -358,6 +449,18 @@
         [
           {
             "node": "Atomic Circuit Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Debounced Event": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Cache Core Delivery Failure",
             "type": "main",
             "index": 0
           }
@@ -414,6 +517,30 @@
         ]
       ]
     },
+    "Log Alert Event": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Cache Core Delivery Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram (Send Alert)": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Cache Core Delivery Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
     "Should Auto-Retry?": {
       "main": [
         [
@@ -448,6 +575,18 @@
         [
           {
             "node": "Log Auto-Retry Submitted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Auto-Retry Submitted": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Cache Core Delivery Failure",
             "type": "main",
             "index": 0
           }
