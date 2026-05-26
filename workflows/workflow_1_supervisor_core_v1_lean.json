@@ -1,29 +1,28 @@
 {
   "name": "Supervisor Core V1 Lean",
-  "description": "R22 Supervisor Core with dead output cleanup, heartbeat-only storm lifecycle authority, named storm others, staticData cleanup, and grouped delivery failure UX.",
   "nodes": [
     {
       "parameters": {},
-      "id": "trigger-error-v1l",
+      "id": "e6147589-2cca-41b0-b694-9d4c74a3f57e",
       "name": "Error Trigger",
       "type": "n8n-nodes-base.errorTrigger",
       "typeVersion": 1,
       "position": [
-        250,
-        500
+        -128,
+        576
       ]
     },
     {
       "parameters": {
         "jsCode": "const item = $input.first().json || {};\nconst sd = $getWorkflowStaticData('global');\nfunction esc(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}\nfunction attr(t){return String(t||'').replace(/&/g,'&amp;').replace(/\"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}\nfunction link(label,url){return url?'<a href=\"'+attr(url)+'\">'+esc(label)+'</a>':'unavailable'}\nfunction sanitize(s){return String(s||'').replace(/postgres(ql)?:\\/\\/[^\\s]+/gi,'[REDACTED_DB_URL]').replace(/\\bBearer\\s+[A-Za-z0-9._~+\\/=-]{20,}/gi,'Bearer [REDACTED_TOKEN]').replace(/(?:key|token|secret|password|apikey|api_key)\\s*[=:]\\s*\\S+/gi,'[REDACTED_CREDENTIAL]').replace(/sk-[A-Za-z0-9_-]{20,}/g,'[REDACTED_API_KEY]')}\nfunction norm(s){return String(s||'').toLowerCase().replace(/https?:\\/\\/[^\\s]+/g,'_url_').replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi,'_uuid_').replace(/\\b\\d{5,}\\b/g,'_num_').replace(/\\s+/g,' ').trim()}\nconst execution=item.execution||{}, trigger=item.trigger||{}, workflow=item.workflow||{};\nconst executionId=String(execution.id||item.executionId||'unknown');\nconst workflowName=String(workflow.name||item.workflowName||'unknown');\nconst workflowId=String(workflow.id||item.workflowId||'unknown');\nconst rawError=execution.error?.message||execution.error?.cause?.message||trigger.error?.message||trigger.error?.cause?.message||trigger.error?.name||item.errorMessage||'No error message available';\nconst failedNode=String(execution.lastNodeExecuted||execution.error?.node?.name||trigger.error?.node?.name||item.failedNode||'trigger_or_unknown');\nconst base=$env.N8N_BASE_URL||'http://localhost:5678';\nlet executionUrl=execution.url||(executionId!=='unknown'?base+'/executions/'+executionId:base+'/executions'); if(executionUrl&&!/^https?:\\/\\//i.test(executionUrl)) executionUrl=base+'/executions';\nconst retryOf=execution.retryOf||item.retryOf||null;\nconst msg=String(rawError||'').toLowerCase();\nlet category='unknown';\nif(/credential|auth|unauthorized|forbidden|401|403/.test(msg)) category='auth';\nelse if(/rate.?limit|429|quota/.test(msg)) category='rate_limit';\nelse if(/timeout|etimedout|504/.test(msg)) category='timeout';\nelse if(/econnrefused|enotfound|econnreset|network|502|503/.test(msg)) category='connectivity';\nelse if(/cannot read prop|undefined|null|typeerror|referenceerror|syntaxerror/.test(msg)) category='code_bug';\nelse if(/memory|heap|out of memory/.test(msg)) category='resource';\nconst severity=category==='auth'?'critical':['rate_limit','timeout','connectivity','resource'].includes(category)?'warning':'error';\nconst severityIcon=severity==='critical'?'🔴':severity==='warning'?'🟡':'🟠';\nconst errorMessage=sanitize(rawError).slice(0,1000);\nconst normalizedError=norm(errorMessage);\nconst htmlError=esc(errorMessage.slice(0,500));\nconst telegramSafeError=esc(errorMessage.slice(0,300));\nconst retryable=['connectivity','rate_limit','timeout'].includes(category)&&!retryOf&&!/credential|auth|unauthorized|forbidden|401|403/i.test(rawError);\nconst now=Date.now();\nconst traceId='err-'+executionId+'-'+now;\nconst fingerprint=(workflowName+'::'+failedNode+'::'+normalizedError.slice(0,200)).toLowerCase().replace(/[^a-z0-9:_]/g,'_').slice(0,250);\nconst fingerprintShort=fingerprint.slice(0,10);\nconst lastSeen=sd['debounce_'+fingerprint]||0;\nconst isDebounced=(now-lastSeen)<30000;\nconst burstKey='burst_'+fingerprint;\nlet burstSuppressedCount=sd[burstKey]||0;\nif(isDebounced){burstSuppressedCount++;sd[burstKey]=burstSuppressedCount;}else{sd['debounce_'+fingerprint]=now;sd[burstKey]=0;}\nconst monitorIds=[$env.SUPERVISOR_WORKFLOW_ID||'', $env.HEARTBEAT_WORKFLOW_ID||'', $env.RETENTION_WORKFLOW_ID||''].filter(Boolean).map(String);\nconst isSelfLoop=monitorIds.includes(String(workflowId))||['supervisor core','heartbeat monitor','data retention'].some(n=>workflowName.toLowerCase().includes(n));\nlet selfLoopThrottled=false;if(isSelfLoop){const k='self_loop_alert_'+fingerprint;selfLoopThrottled=(now-(sd[k]||0))<900000;if(!selfLoopThrottled)sd[k]=now;}\nlet recentFps=sd.recentDistinctFps||[];recentFps=recentFps.filter(e=>e&&(now-e.t)<300000);\n// R22: self-loop errors stay out of storm detection; only fn is stored for failed-node context.\nif(!isDebounced && !isSelfLoop && !recentFps.some(e=>e.fp===fingerprint)) recentFps.push({fp:fingerprint,t:now,wf:workflowName,cat:category,fn:failedNode});\nsd.recentDistinctFps=recentFps.slice(-20);\nconst isStormCondition=recentFps.length>=3, stormDistinctCount=recentFps.length;\nconst wfCounts={}, catCounts={};recentFps.forEach(e=>{if(e.wf)wfCounts[e.wf]=(wfCounts[e.wf]||0)+1;if(e.cat)catCounts[e.cat]=(catCounts[e.cat]||0)+1});\nfunction top(o){const k=Object.keys(o);if(!k.length)return '';k.sort((a,b)=>o[b]-o[a]);return k[0]+' x'+o[k[0]]}\nconst stormDominantWorkflow=top(wfCounts), stormDominantCategory=top(catCounts), stormOtherWorkflowCount=Math.max(0,Object.keys(wfCounts).length-1);\nconst stormSample=recentFps.slice(-3).map(e=>({workflowName:e.wf||'unknown',failedNode:e.fn||'unknown',category:e.cat||'unknown'}));\n// R22: Core only reports active storm context. Heartbeat owns storm lifecycle/resolution.\nlet selfLoopAlertText='';\nif(isSelfLoop&&!selfLoopThrottled) selfLoopAlertText='🔁 <b>SELF-LOOP DETECTED</b>\\n\\n<b>Workflow:</b> '+esc(workflowName)+'\\n<b>Failed Node:</b> '+esc(failedNode)+'\\n<b>Category:</b> '+category+'\\n<b>Error:</b> <code>'+telegramSafeError+'</code>\\n<b>Execution:</b> '+link(executionId,executionUrl)+'\\n<b>Trace:</b> <code>'+traceId+'</code>\\n\\n⚠️ Suppressed before debounce/circuit to prevent monitoring failures from poisoning the main circuit.';\nObject.keys(sd).forEach(k=>{\n  if(k.startsWith('debounce_')&&(now-sd[k])>300000){delete sd[k];const bk='burst_'+k.slice(9);if(sd[bk]!==undefined)delete sd[bk];}\n  else if(k.startsWith('burst_') && (!sd['debounce_'+k.slice(6)] || (now-(sd['debounce_'+k.slice(6)]||0))>300000)) delete sd[k];\n  else if(k.startsWith('self_loop_alert_')&&(now-sd[k])>3600000)delete sd[k];\n  else if(k.startsWith('retry_')&&k.endsWith('_meta')&&sd[k]?.firstSeen&&(now-sd[k].firstSeen)>3600000)delete sd[k];\n});\nreturn [{json:{executionId,workflowName,workflowId,errorMessage,htmlError,telegramSafeError,failedNode,executionUrl,severity,severityIcon,category,categoryLabel:category.replace(/_/g,' '),retryable,retryOf,retryNote:retryable?'retryable transient category ('+category+')':'not retryable',traceId,fingerprint,fingerprintShort,isDebounced,burstSuppressedCount,isSelfLoop,selfLoopThrottled,selfLoopAlertText,isStormCondition,stormDistinctCount,stormDominantCategory,stormDominantWorkflow,stormOtherWorkflowCount,stormSample,noveltyMarker:''}}];"
       },
-      "id": "code-enrich-classify-v1l",
+      "id": "79947434-de9d-4c73-8d85-8558d5b74698",
       "name": "Enrich &amp; Classify",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        500,
-        500
+        128,
+        576
       ]
     },
     {
@@ -49,13 +48,13 @@
         },
         "options": {}
       },
-      "id": "if-self-loop-v1l",
+      "id": "8940b040-7807-4c34-88fc-d4c94d8a5b25",
       "name": "Is Self Loop?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [
-        750,
-        500
+        384,
+        576
       ]
     },
     {
@@ -81,13 +80,13 @@
         },
         "options": {}
       },
-      "id": "if-should-alert-self-loop-v1l",
+      "id": "37756e18-e6f6-4d5d-8390-95a827b70f96",
       "name": "Should Alert Self-Loop?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [
-        1000,
-        300
+        624,
+        368
       ]
     },
     {
@@ -95,18 +94,25 @@
         "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
         "text": "={{ $json.selfLoopAlertText }}",
         "additionalFields": {
-          "parse_mode": "HTML",
-          "disable_web_page_preview": true
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
         }
       },
-      "id": "tg-self-loop-v1l",
+      "id": "02b92333-020a-467a-95ed-969c8c3e46cd",
       "name": "Telegram (Self-Loop Alert)",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.1,
       "position": [
-        1250,
-        250
+        880,
+        320
       ],
+      "webhookId": "5f71fa34-cc33-439c-a6d3-585b4ea2921f",
+      "credentials": {
+        "telegramApi": {
+          "id": "bcEYycJpgjmq4Bvf",
+          "name": "Supervisor TG"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
@@ -117,14 +123,20 @@
           "queryReplacement": "={{ JSON.stringify($json) }}"
         }
       },
-      "id": "pg-log-self-loop-v1l",
+      "id": "c9ad53d6-c130-4e22-a1f4-4490a8cb39be",
       "name": "Log Self-Loop Event",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        1250,
-        100
+        880,
+        176
       ],
+      "credentials": {
+        "postgres": {
+          "id": "po5hLAdXZpOgltjN",
+          "name": "Supervisor Postgres"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
@@ -150,13 +162,13 @@
         },
         "options": {}
       },
-      "id": "if-debounced-v1l",
+      "id": "5ceb801e-a132-4c6d-a598-b30762cafdb4",
       "name": "Is Debounced?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [
-        1000,
-        700
+        624,
+        768
       ]
     },
     {
@@ -167,14 +179,20 @@
           "queryReplacement": "={{ JSON.stringify($json) }}"
         }
       },
-      "id": "pg-log-debounced-v1l",
+      "id": "af1ff5ea-3764-4bbf-b03d-b3de57540eec",
       "name": "Log Debounced Event",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        1250,
-        600
+        880,
+        672
       ],
+      "credentials": {
+        "postgres": {
+          "id": "po5hLAdXZpOgltjN",
+          "name": "Supervisor Postgres"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
@@ -182,44 +200,49 @@
         "operation": "executeQuery",
         "query": "WITH current AS (SELECT status,error_count,opened_at,last_error_at FROM circuit_state WHERE circuit_key='supervisor' FOR UPDATE), upserted AS (INSERT INTO circuit_state (circuit_key,status,error_count,last_error_at,updated_at) VALUES ('supervisor','closed',1,NOW(),NOW()) ON CONFLICT (circuit_key) DO UPDATE SET error_count=CASE WHEN circuit_state.status='closed' AND circuit_state.last_error_at < NOW() - INTERVAL '15 minutes' THEN 1 WHEN circuit_state.status='closed' THEN circuit_state.error_count+1 WHEN circuit_state.status='half_open' THEN circuit_state.error_count+1 ELSE circuit_state.error_count END, status=CASE WHEN circuit_state.status='closed' AND (CASE WHEN circuit_state.last_error_at < NOW() - INTERVAL '15 minutes' THEN 1 ELSE circuit_state.error_count+1 END)>=5 THEN 'open' WHEN circuit_state.status='half_open' AND circuit_state.error_count+1>=2 THEN 'open' WHEN circuit_state.status='half_open' THEN 'half_open' ELSE circuit_state.status END, opened_at=CASE WHEN circuit_state.status='closed' AND (CASE WHEN circuit_state.last_error_at < NOW() - INTERVAL '15 minutes' THEN 1 ELSE circuit_state.error_count+1 END)>=5 THEN NOW() WHEN circuit_state.status='half_open' AND circuit_state.error_count+1>=2 THEN NOW() ELSE circuit_state.opened_at END, half_open_at=CASE WHEN circuit_state.status='half_open' AND circuit_state.error_count+1>=2 THEN NULL ELSE circuit_state.half_open_at END, last_error_at=NOW(), updated_at=NOW() RETURNING *), transition_log AS (INSERT INTO supervisor_events (trace_id,event_type,workflow_name,execution_id,severity,status,fingerprint,payload) SELECT ($1::jsonb)->>'traceId','circuit_transition',($1::jsonb)->>'workflowName',($1::jsonb)->>'executionId','warning',u.status,($1::jsonb)->>'fingerprint',jsonb_build_object('from',c.status,'to',u.status,'error_count',u.error_count,'category',($1::jsonb)->>'category') FROM upserted u JOIN current c ON TRUE WHERE c.status IS NOT NULL AND u.status<>c.status RETURNING id), fp_context AS (SELECT COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS fp_alerts_24h, COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS fp_alerts_1h, MAX(created_at) AS fp_last_alert_at, MIN(created_at) AS fp_first_alert_at, COUNT(DISTINCT workflow_name) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS fp_workflows_24h FROM supervisor_events WHERE event_type='error_alert' AND status='processed' AND fingerprint=($1::jsonb)->>'fingerprint') SELECT u.status,u.error_count,u.opened_at,c.status AS previous_status,c.last_error_at AS previous_last_error_at,EXISTS(SELECT 1 FROM transition_log) AS transition_logged,CASE WHEN c.status='closed' AND u.status='open' THEN 'closed_threshold' WHEN c.status='half_open' AND u.status='open' THEN 'half_open_reopen' ELSE NULL END AS transition_reason,fp.* FROM upserted u LEFT JOIN current c ON TRUE CROSS JOIN fp_context fp",
         "options": {
-          "queryReplacement": "={{ JSON.stringify({ traceId: $json.traceId, workflowName: $json.workflowName, executionId: $json.executionId, fingerprint: $json.fingerprint, workflowId: $json.workflowId, failedNode: $json.failedNode, category: $json.category }) }}",
-          "alwaysOutputData": true
+          "queryReplacement": "={{ JSON.stringify({ traceId: $json.traceId, workflowName: $json.workflowName, executionId: $json.executionId, fingerprint: $json.fingerprint, workflowId: $json.workflowId, failedNode: $json.failedNode, category: $json.category }) }}"
         }
       },
-      "id": "pg-atomic-circuit-v1l",
+      "id": "fdfea627-3bd2-473f-bd6c-c2e1f8b2221f",
       "name": "Atomic Circuit Update",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        1250,
-        800
+        880,
+        880
       ],
+      "credentials": {
+        "postgres": {
+          "id": "po5hLAdXZpOgltjN",
+          "name": "Supervisor Postgres"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "const c=$input.first().json||{};const e=(()=>{try{return $('Enrich &amp; Classify').first().json}catch(x){return {}}})();\nconst isDbError=!!(c.error&&c.error.message)||!c.status;const status=isDbError?'unknown':String(c.status||'unknown');const previousStatus=isDbError?'unknown':String(c.previous_status||status);const errorCount=isDbError?0:parseInt(c.error_count,10)||0;const isTransition=!isDbError&&!!c.previous_status&&status!==previousStatus;const isCircuitOpen=status==='open';const isNewlyOpen=isTransition&&status==='open';if(isCircuitOpen&&!isNewlyOpen)return [];\nlet noveltyMarker='';if(!c.fp_first_alert_at)noveltyMarker='new';else{const ms=new Date(c.fp_last_alert_at).getTime();if(ms>0&&(Date.now()-ms)>86400000)noveltyMarker='recurring';}\nreturn [{json:{...e,noveltyMarker,circuit_status:status,previous_status:previousStatus,transition_reason:c.transition_reason||'',error_count:errorCount,previous_last_error_at:c.previous_last_error_at||null,is_transition:isTransition,transition_logged:!!c.transition_logged,is_circuit_open:isCircuitOpen,is_newly_open:isNewlyOpen,is_circuit_suppressing:false,is_db_error:isDbError,db_error_message:c.error?.message||'',fp_alerts_24h:parseInt(c.fp_alerts_24h,10)||0,fp_alerts_1h:parseInt(c.fp_alerts_1h,10)||0,fp_last_alert_at:c.fp_last_alert_at||null,fp_first_alert_at:c.fp_first_alert_at||null,fp_workflows_24h:parseInt(c.fp_workflows_24h,10)||0}}];"
+        "jsCode": "const c=$input.first().json||{};const e=(()=>{try{return $('Enrich &amp; Classify').first().json}catch(x){return {}}})();\nconst isDbError=!!(c.error&&c.error.message)||!c.status;const status=isDbError?'unknown':String(c.status||'unknown');const previousStatus=isDbError?'unknown':String(c.previous_status||'unknown');const errorCount=isDbError?0:parseInt(c.error_count,10)||0;const isTransition=!isDbError&&!!c.previous_status&&status!==previousStatus;const isCircuitOpen=status==='open';const sd=$getWorkflowStaticData('global');const isNewlyOpen=isCircuitOpen&&!sd._circuitOpenAlertSent&&previousStatus!=='open';if(isCircuitOpen&&!isNewlyOpen)return [];if(isNewlyOpen)sd._circuitOpenAlertSent=true;if(!isCircuitOpen)delete sd._circuitOpenAlertSent;\nlet noveltyMarker='';if(!c.fp_first_alert_at)noveltyMarker='new';else{const ms=new Date(c.fp_last_alert_at).getTime();if(ms>0&&(Date.now()-ms)>86400000)noveltyMarker='recurring';}\nreturn [{json:{...e,noveltyMarker,circuit_status:status,previous_status:previousStatus,transition_reason:c.transition_reason||'',error_count:errorCount,previous_last_error_at:c.previous_last_error_at||null,is_transition:isTransition,transition_logged:!!c.transition_logged,is_circuit_open:isCircuitOpen,is_newly_open:isNewlyOpen,is_circuit_suppressing:false,is_db_error:isDbError,db_error_message:c.error?.message||'',fp_alerts_24h:parseInt(c.fp_alerts_24h,10)||0,fp_alerts_1h:parseInt(c.fp_alerts_1h,10)||0,fp_last_alert_at:c.fp_last_alert_at||null,fp_first_alert_at:c.fp_first_alert_at||null,fp_workflows_24h:parseInt(c.fp_workflows_24h,10)||0}}];"
       },
-      "id": "code-merge-circuit-v1l",
+      "id": "e28cbdfd-ef14-4e40-b5df-b82bcfcfb247",
       "name": "Merge Circuit Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1500,
-        800
+        1136,
+        880
       ]
     },
     {
       "parameters": {
         "jsCode": "const item=$input.first().json;const sd=$getWorkflowStaticData('global');\nfunction h(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}function a(t){return String(t||'').replace(/&/g,'&amp;').replace(/\"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}function link(l,u){return u?'<a href=\"'+a(u)+'\">'+h(l)+'</a>':'unavailable'}function clamp(s,max=3900){s=String(s||'');if(s.length<=max)return s;const note='\\n\\n⚠️ <i>Message truncated</i>';let cut=max-note.length;const lo=s.lastIndexOf('<',cut),lc=s.lastIndexOf('>',cut);if(lo>lc)cut=lo;let t=s.substring(0,cut),stack=[],re=/<(\\/)?(b|i|code|a|pre|u|s)\\b[^>]{0,200}>/gi,m;while((m=re.exec(t))!==null){if(m[1]){if(stack.length)stack.pop()}else stack.push(m[2])}for(let i=stack.length-1;i>=0;i--)t+='</'+stack[i]+'>';return t+note}\nif(sd.eventFailuresPendingClear&&(sd.eventFailures||[]).length<=(sd.eventFailureCountAtFlag||0)){sd.eventFailures=[];sd.droppedCacheCount=0;delete sd.eventFailuresPendingClear;delete sd.eventFailureCountAtFlag}\nlet deliveryBanner='', cached=sd.eventFailures||[];if(cached.length){const counts={};cached.forEach(f=>{counts[f.deliveryKind||'core_delivery_failed']=(counts[f.deliveryKind||'core_delivery_failed']||0)+1});const parts=Object.keys(counts).map(k=>k.replace(/_/g,' ')+': '+counts[k]);const last=cached[cached.length-1]||{};deliveryBanner='⚠️ <b>Supervisor Delivery Degraded</b>\\n• '+parts.join('\\n• ')+'\\n<i>Last source: '+h(last.sourceNode||last.failedNode||'unknown')+'</i>\\n\\n';sd.eventFailuresPendingClear=true;sd.eventFailureCountAtFlag=cached.length;}\nconst rm=sd['retry_'+item.fingerprint+'_meta'];const retryCount=rm?((Date.now()-(rm.firstSeen||0)>3600000)?0:(rm.count||0)):0;const never=String($env.NEVER_RETRY_WORKFLOW_IDS||'').split(',').map(s=>s.trim()).filter(Boolean);const hasExec=item.executionId&&item.executionId!=='unknown'&&/^[A-Za-z0-9_-]+$/.test(String(item.executionId));const allowed=['connectivity','rate_limit','timeout'].includes(item.category);const circuitOk=!item.is_db_error&&item.circuit_status!=='open'&&!item.is_newly_open;const retryGate=item.is_db_error?'db_unavailable':item.isStormCondition?'storm_suppressed':item.is_newly_open?'circuit_opened':item.retryOf?'retry_execution':never.includes(String(item.workflowId))?'workflow_denied':!hasExec?'no_execution_id':retryCount>=2?'budget_exhausted':(item.retryable&&allowed&&circuitOk?'eligible':'not_retryable');\nconst supervisorAction=item.is_newly_open?'Circuit opened; suppressing follow-up noise.':retryGate==='eligible'?'Auto-retry scheduled after backoff.':item.isStormCondition?'Retry suppressed during storm.':item.is_db_error?'DB unavailable; alert sent with degraded control plane.':'Alert logged; awaiting operator review.';\nconst advice={auth:['Credential expired, revoked, or permission issue.','Check credential validity and recent permission changes.'],rate_limit:['External API quota or burst threshold reached.','Confirm provider rate limits; reduce concurrency or increase backoff.'],timeout:['Slow dependency or long-running operation.','Check external service latency and node timeout settings.'],connectivity:['Network, DNS, or remote service availability issue.','Check service status and recent infrastructure changes.'],code_bug:['Expression or Code node received unexpected data shape.','Inspect input payload and add null guards.'],resource:['Memory, heap, or platform resource pressure.','Check execution size, binary data, and container limits.'],unknown:['Unclassified failure.','Open execution and inspect node output.']}[item.category]||['Unclassified failure.','Open execution and inspect node output.'];\nconst reasonLine=item.transition_reason?'<b>Reason:</b> '+h(String(item.transition_reason).replace(/_/g,' '))+'\\n':'';const circuitBanner=item.is_newly_open?'🔴 <b>CIRCUIT BREAKER OPENED</b>\\n<b>Threshold:</b> '+item.error_count+' of 5\\n'+reasonLine+'<b>Effect:</b> New errors suppressed until recovery probe.\\n<b>Recovery probe:</b> ~5-10 min after errors stop (next heartbeat cycle)\\n\\n':'';\nlet stormBanner='';if(item.isStormCondition){const dominant=String(item.stormDominantWorkflow||'mixed').replace(/ x\\d+$/,''),cat=String(item.stormDominantCategory||'mixed').replace(/ x\\d+$/,'');let otherNames='';if(item.stormOtherWorkflowCount>0&&Array.isArray(item.stormSample)){const others=[...new Set(item.stormSample.map(s=>s.workflowName).filter(n=>n&&n!==dominant&&n!=='unknown'))];otherNames=others.length?' + '+others.map(h).join(', '):' + '+item.stormOtherWorkflowCount+' others';}stormBanner='⛈ <b>ERROR STORM — '+item.stormDistinctCount+' distinct errors in 5m</b>\\n📍 <b>'+h(dominant)+'</b> ('+h(cat)+')'+otherNames+'\\n<i>Multiple failures suggest a systemic issue.</i>\\n\\n';}\nconst novelty=item.noveltyMarker==='new'?'🆕 ':item.noveltyMarker==='recurring'?'🔄 ':'';let label=novelty+'NEW ERROR';if(item.is_newly_open)label=novelty+'CIRCUIT OPEN';else if(item.burstSuppressedCount>0)label=novelty+'BURST UPDATE (+'+item.burstSuppressedCount+' suppressed)';else if(item.retryOf)label=novelty+'RETRY FAILED';\nconst retryLine=retryGate==='eligible'?'<b>Retryable:</b> eligible (transient) — subject to budget & circuit':'<b>Retryable:</b> no ('+retryGate.replace(/_/g,' ')+')';const circuitLine=item.is_db_error?'Circuit: ⚠️ unknown — Postgres unavailable':'Circuit: Error '+item.error_count+' of 5'+(!item.is_circuit_open&&!item.is_db_error&&item.circuit_status!=='half_open'&&item.error_count>0?' (resets in ~15m if quiet)':'');\nlet text=deliveryBanner+circuitBanner+stormBanner+item.severityIcon+' <b>'+label+' — '+h(item.categoryLabel)+(item.fingerprintShort?' · fp:'+item.fingerprintShort:'')+'</b>\\n\\n<b>Workflow:</b> '+h(item.workflowName)+' → '+h(item.failedNode)+'\\n<b>Error:</b> <code>'+item.htmlError+'</code>\\n<b>Execution:</b> '+link('Open execution',item.executionUrl)+'\\n\\n💡 '+advice[0]+'\\n🔧 '+advice[1]+'\\n\\n'+retryLine+'\\n🧭 <b>Supervisor:</b> '+h(supervisorAction)+'\\n<b>'+circuitLine+'</b>'+(item.burstSuppressedCount>0?'\\n⚡ <b>Suppressed:</b> '+item.burstSuppressedCount+' duplicate(s) since last alert':'')+'\\n\\n<b>Trace:</b> <code>'+item.traceId+'</code>\\n<b>Timestamp:</b> '+new Date().toLocaleString('en-PH',{timeZone:'Asia/Manila',year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});\nreturn [{json:{...item,retryGate,supervisorAction,alertText:clamp(text)}}];"
       },
-      "id": "code-fmt-alert-v1l",
+      "id": "dbdea648-a8cc-4087-ab13-750bedadea4d",
       "name": "Format Alert Message",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1750,
-        800
+        1376,
+        880
       ]
     },
     {
@@ -230,14 +253,20 @@
           "queryReplacement": "={{ JSON.stringify({ traceId:$json.traceId, workflowName:$json.workflowName, workflowId:$json.workflowId, executionId:$json.executionId, executionUrl:$json.executionUrl, failedNode:$json.failedNode, errorExcerpt:String($json.errorMessage||'').slice(0,500), severity:$json.severity, fingerprint:$json.fingerprint, retryable:String($json.retryable), retryGate:$json.retryGate, retryOf:$json.retryOf||'', retryNote:$json.retryNote, error_count:$json.error_count, category:$json.category, burstSuppressedCount:$json.burstSuppressedCount, is_db_error:String($json.is_db_error), is_newly_open:String($json.is_newly_open||false), circuit_status:$json.circuit_status||'', previous_status:$json.previous_status||'', transition_reason:$json.transition_reason||'', noveltyMarker:$json.noveltyMarker||'', fingerprintShort:$json.fingerprintShort||'', fp_alerts_24h:$json.fp_alerts_24h||0, fp_alerts_1h:$json.fp_alerts_1h||0, fp_last_alert_at:$json.fp_last_alert_at||'', isStormCondition:String($json.isStormCondition||false), stormDistinctCount:$json.stormDistinctCount||0, stormDominantCategory:$json.stormDominantCategory||'', stormDominantWorkflow:$json.stormDominantWorkflow||'', stormOtherWorkflowCount:$json.stormOtherWorkflowCount||0, stormSample:$json.stormSample||[], supervisorAction:$json.supervisorAction||'' }) }}"
         }
       },
-      "id": "pg-log-alert-v1l",
+      "id": "877b21b1-06da-4747-9d5c-882d4332f502",
       "name": "Log Alert Event",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        2000,
-        700
+        1632,
+        768
       ],
+      "credentials": {
+        "postgres": {
+          "id": "po5hLAdXZpOgltjN",
+          "name": "Supervisor Postgres"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
@@ -245,48 +274,54 @@
         "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
         "text": "={{ $json.alertText }}",
         "additionalFields": {
-          "parse_mode": "HTML",
           "disable_notification": "={{ $json.severity !== 'critical' && !$json.is_newly_open }}",
-          "disable_web_page_preview": true
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
         }
       },
-      "id": "tg-send-alert-v1l",
+      "id": "ab70cfac-f00f-4de1-9271-3e413a1f2766",
       "name": "Telegram (Send Alert)",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.1,
       "position": [
-        2000,
-        800
+        1632,
+        880
       ],
+      "webhookId": "83555663-9517-4009-acc7-a24342ae1c47",
+      "credentials": {
+        "telegramApi": {
+          "id": "bcEYycJpgjmq4Bvf",
+          "name": "Supervisor TG"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "jsCode": "const item=$input.first().json;const sd=$getWorkflowStaticData('global');const now=Date.now();if(item.retryGate!=='eligible')return[];const key='retry_'+item.fingerprint+'_meta';let meta=sd[key]||{count:0,firstSeen:now};if(now-meta.firstSeen>3600000)meta={count:0,firstSeen:now};const retryDelaySeconds=Math.min(15*Math.pow(2,meta.count),120)+Math.floor(Math.random()*5);meta.count++;meta.lastRetryAt=now;sd[key]=meta;const base=$env.N8N_BASE_URL||'http://localhost:5678';return[{json:{...item,shouldRetry:true,retryAttempt:meta.count,retryLimit:2,retryDelaySeconds,retryApiUrl:base+'/api/v1/executions/'+item.executionId+'/retry',autoRetryReason:'retryable transient failure (planned attempt '+meta.count+'/2, delay '+retryDelaySeconds+'s)'}}];"
       },
-      "id": "code-should-retry-v1l",
+      "id": "8e88deb9-71dd-4fd3-a8c8-ac706bd8925c",
       "name": "Should Auto-Retry?",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        2000,
-        900
+        1632,
+        976
       ]
     },
     {
       "parameters": {
-        "resume": "timeInterval",
-        "amount": "={{ $json.retryDelaySeconds }}",
-        "unit": "seconds"
+        "amount": "={{ $json.retryDelaySeconds }}"
       },
-      "id": "wait-backoff-v1l",
+      "id": "08567647-f9a3-498e-ae93-19b2f609cca6",
       "name": "Wait (Backoff)",
       "type": "n8n-nodes-base.wait",
       "typeVersion": 1.1,
       "position": [
-        2250,
-        900
-      ]
+        1872,
+        976
+      ],
+      "webhookId": "bcfdd045-84ea-4312-b404-692255ba2fa8"
     },
     {
       "parameters": {
@@ -298,14 +333,20 @@
           "timeout": 10000
         }
       },
-      "id": "http-auto-retry-v1l",
+      "id": "b7951372-637c-4e03-bb85-e36282e080e2",
       "name": "HTTP (Auto-Retry Execution)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        2500,
-        900
+        2128,
+        976
       ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "BmvjcmGpZ9SS6SfA",
+          "name": "Supervisor n8n API"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
@@ -316,45 +357,52 @@
           "queryReplacement": "={{ JSON.stringify({ traceId:$('Should Auto-Retry?').first().json.traceId, workflowName:$('Should Auto-Retry?').first().json.workflowName, executionId:$('Should Auto-Retry?').first().json.executionId, fingerprint:$('Should Auto-Retry?').first().json.fingerprint, status:$json.error?'retry_submit_failed':'retry_submitted', retryGate:$('Should Auto-Retry?').first().json.retryGate||'eligible', retryAttempt:$('Should Auto-Retry?').first().json.retryAttempt, retryLimit:$('Should Auto-Retry?').first().json.retryLimit, retryDelaySeconds:$('Should Auto-Retry?').first().json.retryDelaySeconds, category:$('Should Auto-Retry?').first().json.category, autoRetryReason:$('Should Auto-Retry?').first().json.autoRetryReason, httpError:$json.error?($json.error.message||'retry API call failed'):'' }) }}"
         }
       },
-      "id": "pg-log-retry-v1l",
+      "id": "8149c69f-5ce5-4617-9a68-2f2f7b2ddbcd",
       "name": "Log Auto-Retry Submitted",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        2750,
-        900
+        2384,
+        976
       ],
+      "credentials": {
+        "postgres": {
+          "id": "po5hLAdXZpOgltjN",
+          "name": "Supervisor Postgres"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "jsCode": "const sd=$getWorkflowStaticData('global');const item=$input.first().json||{};if(!sd.eventFailures)sd.eventFailures=[];const sourceNode=item.node?.name||item.nodeName||item.error?.node?.name||item.failedNode||'unknown_delivery_node';const deliveryKind=sourceNode.includes('Telegram')?'telegram_delivery_failed':(sourceNode.includes('Log')||sourceNode.includes('Postgres'))?'postgres_log_failed':'core_delivery_failed';sd.eventFailures.push({timestamp:new Date().toISOString(),traceId:item.traceId||item.json?.traceId||'unknown',eventType:deliveryKind,deliveryKind,sourceNode,source:'Supervisor Core',workflowName:item.workflowName||item.json?.workflowName||'Supervisor Core',failedNode:sourceNode,reason:(item.error?.message||item.message||deliveryKind)+' at '+sourceNode});if(sd.eventFailures.length>50){sd.droppedCacheCount=(sd.droppedCacheCount||0)+(sd.eventFailures.length-50);sd.eventFailures=sd.eventFailures.slice(-50)}return[{json:{cached:true,count:sd.eventFailures.length,dropped:sd.droppedCacheCount||0,deliveryKind,sourceNode}}];"
       },
-      "id": "code-cache-core-fail-v1l",
+      "id": "22ee0c01-70bc-436e-b8eb-cf284e40948c",
       "name": "Cache Core Delivery Failure",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        3000,
-        650
+        2624,
+        720
       ]
     },
     {
       "parameters": {
         "content": "## 🛡️ Supervisor Core V1 Lean (Round 22 Build)\n**18 executable nodes. R22 internal hardening, zero new nodes.**\n\n- R22: dead output fields removed\n- R22: Core storm resolved banner removed; Heartbeat owns storm lifecycle\n- R22: storm others named from stormSample\n- R22: burst/retry staticData cleanup added\n- R22: delivery failure banner grouped by deliveryKind\n- R21: storm failedNode fix, Supervisor Action line, recovery probe estimate",
-        "width": 680,
-        "height": 620
+        "height": 620,
+        "width": 680
       },
-      "id": "sticky-info-v1l",
+      "id": "da4c34f9-0013-49d9-8f75-561a8269e3ca",
       "name": "Sticky Note",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
       "position": [
-        250,
-        30
+        1936,
+        -96
       ]
     }
   ],
+  "pinData": {},
   "connections": {
     "Error Trigger": {
       "main": [
@@ -409,8 +457,7 @@
             "type": "main",
             "index": 0
           }
-        ],
-        []
+        ]
       ]
     },
     "Telegram (Self-Loop Alert)": {
@@ -594,18 +641,20 @@
       ]
     }
   },
+  "active": true,
   "settings": {
     "executionOrder": "v1",
-    "executionTimeout": 300,
-    "saveExecutionProgress": true
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "saveExecutionProgress": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
   },
-  "staticData": null,
-  "tags": [
-    {
-      "name": "production-v1-lean"
-    },
-    {
-      "name": "supervisor"
-    }
-  ]
+  "versionId": "43f87f9c-5b42-4416-84d1-1b406574e0f7",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "22da58545622faa6c02ad360173659ae50818de9a11aee046593ea6a8484167e"
+  },
+  "id": "Ky8MWwAun7gcEHtT",
+  "tags": []
 }

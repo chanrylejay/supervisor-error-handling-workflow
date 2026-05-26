@@ -1,42 +1,39 @@
 {
   "name": "Heartbeat Monitor V1 Lean",
-  "description": "R22 heartbeat monitor with top error sources, activation state-change reminders/links, orphan API throttle, humanized control-plane labels, grouped delivery cache, and classifier drift display.",
   "nodes": [
     {
       "parameters": {
         "rule": {
           "interval": [
             {
-              "field": "minutes",
-              "minutesInterval": 5
+              "field": "minutes"
             }
           ]
         }
       },
-      "id": "trigger-schedule-hb-v1l",
+      "id": "e91c898e-1891-4127-bfad-1f00fafd18c6",
       "name": "Schedule Trigger",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [
-        0,
-        300
+        496,
+        400
       ]
     },
     {
       "parameters": {
-        "method": "GET",
         "url": "={{ $env.HEALTHCHECKS_PING_URL + '/start' }}",
         "options": {
           "timeout": 10000
         }
       },
-      "id": "http-dms-start-v1l",
+      "id": "d74b84d2-8745-4f2b-a206-9c6cf05cb1f4",
       "name": "HTTP (DMS Start)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        200,
-        300
+        704,
+        400
       ],
       "onError": "continueErrorOutput"
     },
@@ -44,41 +41,48 @@
       "parameters": {
         "operation": "executeQuery",
         "query": "WITH recover_open AS (\n  UPDATE circuit_state SET status='half_open', error_count=0, updated_at=NOW(), half_open_at=NOW()\n  WHERE circuit_key='supervisor' AND status='open' AND last_error_at < NOW() - INTERVAL '5 minutes'\n  RETURNING circuit_key,status,'open' AS previous_status,'heartbeat-recovery-'||FLOOR(EXTRACT(EPOCH FROM NOW())*1000)::BIGINT AS trace_id,5 AS cooldown_minutes\n), reset_half_open AS (\n  UPDATE circuit_state SET status='closed', error_count=0, updated_at=NOW(), half_open_at=NULL\n  WHERE circuit_key='supervisor' AND status='half_open' AND last_error_at < NOW() - INTERVAL '10 minutes' AND NOT EXISTS (SELECT 1 FROM recover_open)\n  RETURNING circuit_key,status,'half_open' AS previous_status,'heartbeat-recovery-'||FLOOR(EXTRACT(EPOCH FROM NOW())*1000)::BIGINT AS trace_id,10 AS cooldown_minutes\n), all_transitions AS (SELECT * FROM recover_open UNION ALL SELECT * FROM reset_half_open), transition_log AS (\n  INSERT INTO supervisor_events (trace_id,event_type,workflow_name,execution_id,severity,status,payload)\n  SELECT trace_id,'circuit_transition','Heartbeat Monitor','heartbeat','info',status,jsonb_build_object('from',previous_status,'to',status,'reason','heartbeat_recovery_probe','cooldown_minutes',cooldown_minutes) FROM all_transitions RETURNING id\n)\nSELECT (SELECT COUNT(*) FROM all_transitions) AS transitions_count,(SELECT COUNT(*) FROM transition_log) AS transitions_logged,(SELECT status FROM circuit_state WHERE circuit_key='supervisor') AS current_status",
-        "options": {
-          "alwaysOutputData": true
-        }
+        "options": {}
       },
-      "id": "pg-circuit-reset-v1l",
+      "id": "a2ce09f0-ec74-4aa9-86dc-e2ee9394b4d6",
       "name": "Circuit Reset Probe",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        400,
-        300
+        896,
+        400
       ],
+      "credentials": {
+        "postgres": {
+          "id": "po5hLAdXZpOgltjN",
+          "name": "Supervisor Postgres"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "operation": "executeQuery",
         "query": "WITH cs AS (\n  SELECT COALESCE((SELECT status FROM circuit_state WHERE circuit_key='supervisor'),'closed') AS circuit_status,\n         COALESCE((SELECT error_count FROM circuit_state WHERE circuit_key='supervisor'),0) AS error_count,\n         (SELECT half_open_at FROM circuit_state WHERE circuit_key='supervisor') AS half_open_at\n), evt AS (\n  SELECT event_type, workflow_name, failed_node, fingerprint, created_at, status,\n         CASE WHEN event_type='error_alert' THEN payload->>'category' ELSE NULL END AS evt_category\n  FROM supervisor_events WHERE created_at > NOW() - INTERVAL '24 hours'\n), agg AS (\n  SELECT COUNT(*) FILTER (WHERE event_type='error_alert' AND status='processed' AND created_at > NOW() - INTERVAL '1 hour') AS errors_last_hour,\n         COUNT(*) FILTER (WHERE event_type='error_alert' AND status='processed') AS errors_last_24h,\n         MAX(created_at) FILTER (WHERE event_type='error_alert' AND status='processed') AS last_error_at,\n         MAX(created_at) FILTER (WHERE event_type='retention_completed') AS last_retention_at,\n         COUNT(*) FILTER (WHERE event_type='error_alert' AND status='retry_submitted' AND created_at > NOW() - INTERVAL '1 hour') AS retries_last_hour,\n         COUNT(*) FILTER (WHERE event_type='error_alert' AND status='retry_submitted') AS retries_last_24h,\n         COUNT(*) FILTER (WHERE event_type='error_alert' AND status='retry_submit_failed' AND created_at > NOW() - INTERVAL '1 hour') AS retry_failures_1h,\n         COUNT(*) FILTER (WHERE event_type='error_alert' AND status='retry_submit_failed') AS retry_failures_24h,\n         COUNT(*) FILTER (WHERE event_type='circuit_transition' AND created_at > NOW() - INTERVAL '2 hours') AS circuit_transitions_2h,\n         COUNT(*) FILTER (WHERE event_type='error_alert' AND status='processed' AND COALESCE(evt_category,'')='unknown') AS unknown_errors_24h,\n         COUNT(DISTINCT fingerprint) FILTER (WHERE event_type='error_alert' AND status='processed' AND created_at > NOW() - INTERVAL '5 minutes') AS distinct_fps_5m,\n         COUNT(DISTINCT workflow_name) FILTER (WHERE event_type='error_alert' AND status='processed' AND created_at > NOW() - INTERVAL '5 minutes') AS distinct_workflows_5m\n  FROM evt\n), top_src AS (\n  SELECT workflow_name, failed_node, COUNT(*) AS error_count, COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS errors_1h\n  FROM evt WHERE event_type='error_alert' AND status='processed'\n  GROUP BY workflow_name, failed_node ORDER BY error_count DESC LIMIT 5\n)\nSELECT cs.*, agg.*, COALESCE((SELECT jsonb_agg(row_to_json(t)) FROM top_src t),'[]'::jsonb) AS top_error_sources FROM cs CROSS JOIN agg",
-        "options": {
-          "alwaysOutputData": true
-        }
+        "options": {}
       },
-      "id": "pg-system-status-v1l",
+      "id": "12408a35-6327-429f-8c19-2ecd4a7a0cc9",
       "name": "System Status",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        650,
-        300
+        1152,
+        400
       ],
+      "credentials": {
+        "postgres": {
+          "id": "po5hLAdXZpOgltjN",
+          "name": "Supervisor Postgres"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "method": "GET",
         "url": "http://localhost:5678/api/v1/executions?status=running&limit=100",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
@@ -86,27 +90,33 @@
           "timeout": 10000
         }
       },
-      "id": "http-running-exec-v1l",
+      "id": "e4aae742-8a0f-458e-8b30-2c9ca051e595",
       "name": "HTTP (Running Executions)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        900,
-        300
+        1408,
+        400
       ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "BmvjcmGpZ9SS6SfA",
+          "name": "Supervisor n8n API"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "jsCode": "const item=$input.first().json||{};\nconst sd=$getWorkflowStaticData('global');\nfunction h(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}\nfunction a(t){return String(t||'').replace(/&/g,'&amp;').replace(/\"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}\nfunction link(l,u){return u?'<a href=\"'+a(u)+'\">'+h(l)+'</a>':h(l)}\nfunction empty(s){return{orphanState:s,apiError:false,hasOrphans:false,hasAlertableOrphans:false,shouldAlertOrphans:false,orphanCount:0,alertableOrphanCount:0,alertableOrphanArray:'[]',orphanAlertText:''}}\nfunction tier(m){if(m>=360)return{icon:'🔴',label:'CRITICAL',note:' — likely stuck, consider manual termination'};if(m>=120)return{icon:'🟠',label:'ELEVATED',note:' — extended runtime, investigate soon'};return{icon:'⚠️',label:'WARNING',note:''}}\nif(item.error){const now=Date.now();const k='orphan_api_error_last_alert_at';const due=now-(sd[k]||0)>1800000;if(due)sd[k]=now;return[{json:{...empty('api_error'),apiError:true,shouldAlertOrphans:due,orphanAlertText:due?'🔴 <b>HEARTBEAT — EXECUTIONS API UNREACHABLE</b>\\n\\n<b>Error:</b> <code>'+h(item.error.message||'n8n API unreachable')+'</code>':''}}];}\nconst arr=Array.isArray(item.data)?item.data:(Array.isArray(item)?item:[]);\nconst now=Date.now(),base=$env.N8N_BASE_URL||'http://localhost:5678';\nconst exclude=new Set([($env.SUPERVISOR_WORKFLOW_ID||''),($env.HEARTBEAT_WORKFLOW_ID||''),($env.RETENTION_WORKFLOW_ID||''),...String($env.LONG_RUNNING_WORKFLOW_IDS||'').split(',').map(s=>s.trim())].filter(Boolean).map(String));\nconst orphans=arr.filter(x=>{const st=new Date(x.startedAt||x.createdAt).getTime();return st&&!Number.isNaN(st)&&!x.waitTill&&!x.stoppedAt&&!exclude.has(String(x.workflowId))&&(now-st)>1800000}).map(x=>({executionId:String(x.id),workflowId:String(x.workflowId||'unknown'),workflowName:x.workflowName||x.workflow?.name||'unknown',runningMinutes:Math.round((now-new Date(x.startedAt||x.createdAt).getTime())/60000),executionUrl:base+'/executions/'+String(x.id),workflowUrl:base+'/workflow/'+String(x.workflowId||'')}));\nlet mem=sd.orphan_alert_memory||{};\nconst alertable=orphans.filter(o=>now-(mem[o.executionId]||0)>3600000);\nconst alertableWithContext=alertable.map(o=>({...o,isReAlert:!!mem[o.executionId]}));\nfor(const o of alertable)mem[o.executionId]=now;\nconst currentOrphanIds=new Set(orphans.map(o=>o.executionId));\nObject.keys(mem).forEach(eid=>{if(!currentOrphanIds.has(eid)&&(now-mem[eid])>7200000)delete mem[eid];});\nsd.orphan_alert_memory=mem;\nconst alertableOrphanArray=alertableWithContext.map(o=>({executionId:o.executionId,workflowId:o.workflowId,workflowName:o.workflowName,runningMinutes:o.runningMinutes,orphanCount:orphans.length,isReAlert:!!o.isReAlert}));\nlet text='';\nif(alertableWithContext.length){let maxTier={icon:'⚠️',label:'WARNING',note:''};alertableWithContext.forEach(o=>{const t=tier(o.runningMinutes);if(t.label==='CRITICAL'||(t.label==='ELEVATED'&&maxTier.label!=='CRITICAL'))maxTier=t;});text=maxTier.icon+' <b>ORPHAN EXECUTION — '+maxTier.label+'</b>\\n\\n'+alertableWithContext.slice(0,5).map(o=>{const t=tier(o.runningMinutes);return t.icon+' '+(o.isReAlert?'🔄 ':'')+'<b>Execution:</b> '+link('#'+o.executionId,o.executionUrl)+'\\n<b>Workflow:</b> '+link(o.workflowName,o.workflowUrl)+'\\n<b>Running:</b> '+o.runningMinutes+' minutes'+t.note}).join('\\n---\\n')+'\\n\\n<b>Total Orphans:</b> '+orphans.length+(orphans.length!==alertable.length?' ('+alertable.length+' newly alertable)':'');}\nreturn[{json:{orphanState:orphans.length?'found':'none',apiError:false,hasOrphans:orphans.length>0,hasAlertableOrphans:alertable.length>0,shouldAlertOrphans:alertable.length>0,orphanCount:orphans.length,alertableOrphanCount:alertable.length,alertableOrphanArray:JSON.stringify(alertableOrphanArray),orphanAlertText:text}}];"
       },
-      "id": "code-detect-orphans-v1l",
+      "id": "7b38c5ee-615c-42b4-9f08-1fd306e710bd",
       "name": "Detect Orphans",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1150,
-        300
+        1648,
+        400
       ]
     },
     {
@@ -132,13 +142,13 @@
         },
         "options": {}
       },
-      "id": "if-should-alert-orphans-v1l",
+      "id": "0f5d37ea-9cd0-4ac7-9a18-9efa1268dda0",
       "name": "Should Alert Orphans?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [
-        1400,
-        200
+        1904,
+        304
       ]
     },
     {
@@ -149,14 +159,20 @@
           "queryReplacement": "={{ $('Detect Orphans').first().json.alertableOrphanArray }}"
         }
       },
-      "id": "pg-log-orphans-v1l",
+      "id": "bcd882a8-10bf-4db0-a862-84af4deded19",
       "name": "Log Orphans",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        1650,
-        100
+        2160,
+        208
       ],
+      "credentials": {
+        "postgres": {
+          "id": "po5hLAdXZpOgltjN",
+          "name": "Supervisor Postgres"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
@@ -164,23 +180,29 @@
         "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
         "text": "={{ $('Detect Orphans').first().json.orphanAlertText }}",
         "additionalFields": {
-          "parse_mode": "HTML",
-          "disable_web_page_preview": true
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
         }
       },
-      "id": "tg-orphan-alert-v1l",
+      "id": "5e731830-f8f6-411e-bf1b-b189e9de115f",
       "name": "Telegram (Orphan Alert)",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.1,
       "position": [
-        1650,
-        250
+        2160,
+        352
       ],
+      "webhookId": "128dcd9b-54e5-4a81-93c3-cb5dada7d867",
+      "credentials": {
+        "telegramApi": {
+          "id": "bcEYycJpgjmq4Bvf",
+          "name": "Supervisor TG"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "method": "GET",
         "url": "http://localhost:5678/api/v1/workflows?active=true&limit=250",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
@@ -188,27 +210,33 @@
           "timeout": 10000
         }
       },
-      "id": "http-active-workflows-v1l",
+      "id": "0c82279a-da7c-45e7-adba-e9822c0e24f6",
       "name": "HTTP (Active Workflows)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        1400,
-        500
+        1904,
+        608
       ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "BmvjcmGpZ9SS6SfA",
+          "name": "Supervisor n8n API"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "jsCode": "const item=$input.first().json||{};\nconst sd=$getWorkflowStaticData('global');\nfunction h(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}\nfunction a(t){return String(t||'').replace(/&/g,'&amp;').replace(/\"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}\nfunction link(l,u){return u?'<a href=\"'+a(u)+'\">'+h(l)+'</a>':h(l)}\nconst base=$env.N8N_BASE_URL||'http://localhost:5678';\nconst ids=String($env.CRITICAL_WORKFLOW_IDS||'').split(',').map(s=>s.trim()).filter(Boolean).sort();\nif(!ids.length)return[{json:{activationConfigured:false,activationIssue:false,hasDeactivated:false,activationUncertain:false,shouldAlertActivation:false,deactivatedIds:[],deactivatedUrls:[],activeCount:0,expectedCount:0,activationMessage:'CRITICAL_WORKFLOW_IDS not configured',activationAlertText:'',activationDisplayText:''}}];\nlet active=new Set(), activationUncertain=false, activationMessage='';\nif(item.error){activationUncertain=true;activationMessage=item.error.message||'Active workflow API error'}\nelse{const arr=Array.isArray(item.data)?item.data:(Array.isArray(item)?item:[]);active=new Set(arr.map(w=>String(w.id)));}\nconst missing=activationUncertain?[]:ids.filter(id=>!active.has(String(id))).sort();\nconst deactivatedUrls=missing.map(id=>base+'/workflow/'+id);\nconst activationIssue=activationUncertain||missing.length>0;\nconst stateHash=JSON.stringify({uncertain:activationUncertain,missing,configured:ids});\nconst changed=stateHash!==(sd.lastActivationStateHash||'');\nconst reminderDue=Date.now()-(sd.lastActivationPulseAt||0)>21600000;\nconst shouldAlertActivation=activationIssue&&(changed||reminderDue);\nif(activationIssue&&shouldAlertActivation)sd.lastActivationPulseAt=Date.now();\nsd.lastActivationStateHash=stateHash;\nconst inactiveLinks=missing.map((id,i)=>link(id,deactivatedUrls[i])).join(', ');\nif(activationUncertain)return[{json:{activationConfigured:true,activationIssue:true,hasDeactivated:false,activationUncertain:true,shouldAlertActivation,deactivatedIds:[],deactivatedUrls:[],activeCount:0,expectedCount:ids.length,activationMessage,activationAlertText:shouldAlertActivation?'⚠️ <b>WORKFLOW ACTIVATION CHECK</b>\\n\\nActivation check uncertain: '+h(activationMessage):'',activationDisplayText:'⚠️ <b>Activation Uncertain:</b> '+h(activationMessage)}}];\nreturn[{json:{activationConfigured:true,activationIssue:missing.length>0,hasDeactivated:missing.length>0,activationUncertain:false,shouldAlertActivation,deactivatedIds:missing,deactivatedUrls,activeCount:active.size,expectedCount:ids.length,activationMessage:missing.length?missing.length+' critical workflow(s) inactive':'All critical workflows active',activationAlertText:missing.length&&shouldAlertActivation?'⚠️ <b>WORKFLOW ACTIVATION CHECK</b>\\n\\nInactive: '+inactiveLinks:'',activationDisplayText:missing.length?'⚠️ <b>Inactive Critical:</b> '+inactiveLinks:'✅ <b>Workflows:</b> '+ids.length+'/'+ids.length+' active'}}];"
       },
-      "id": "code-detect-activation-v1l",
+      "id": "fa87b87d-5b5e-4ace-8a16-9db3bb3b2c5f",
       "name": "Detect Activation State",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1650,
-        500
+        2160,
+        608
       ]
     },
     {
@@ -234,13 +262,13 @@
         },
         "options": {}
       },
-      "id": "if-activation-issue-v1l",
+      "id": "a6f4d0c4-602e-489b-b15d-cf7fa54644a2",
       "name": "Has Activation Issue?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [
-        1900,
-        400
+        2400,
+        512
       ]
     },
     {
@@ -248,31 +276,38 @@
         "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
         "text": "={{ $('Detect Activation State').first().json.activationAlertText }}",
         "additionalFields": {
-          "parse_mode": "HTML",
-          "disable_web_page_preview": true
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
         }
       },
-      "id": "tg-activation-alert-v1l",
+      "id": "407f5f7e-7cfc-43af-b4f5-d547d0580e42",
       "name": "Telegram (Activation Alert)",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.1,
       "position": [
-        2150,
-        300
+        2656,
+        400
       ],
+      "webhookId": "0048bd2f-1580-489d-b078-d4beff2342d6",
+      "credentials": {
+        "telegramApi": {
+          "id": "bcEYycJpgjmq4Bvf",
+          "name": "Supervisor TG"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "jsCode": "const crypto=require('crypto');\nfunction safeRef(name){try{return $(name).first().json||{}}catch(e){return{}}}\nfunction h(t){return String(t||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}\nfunction clamp(s,max=3900){s=String(s||'');if(s.length<=max)return s;const note='\\n\\n⚠️ <i>Message truncated</i>';let cut=max-note.length;const lo=s.lastIndexOf('<',cut),lc=s.lastIndexOf('>',cut);if(lo>lc)cut=lo;let t=s.substring(0,cut),stack=[],re=/<(\\/)?(b|i|code|a|pre|u|s)\\b[^>]{0,200}>/gi,m;while((m=re.exec(t))!==null){if(m[1]){if(stack.length)stack.pop()}else stack.push(m[2])}for(let i=stack.length-1;i>=0;i--)t+='</'+stack[i]+'>';return t+note}\nfunction n(v){const x=parseInt(v,10);return Number.isFinite(x)?x:0}function bucket(v,s){return Math.floor(n(v)/s)*s}function dt(x){return x?new Date(x).toLocaleString('en-PH',{timeZone:'Asia/Manila',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false}):'no record'}function ts(){return new Date().toLocaleString('en-PH',{timeZone:'Asia/Manila',year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})}function dur(ms){const m=Math.max(0,Math.round(ms/60000));return m<60?m+'m':Math.floor(m/60)+'h'+(m%60?m%60+'m':'')}\nconst st=safeRef('System Status'), act=safeRef('Detect Activation State'), orph=safeRef('Detect Orphans'), sd=$getWorkflowStaticData('global'), now=Date.now();\nconst isDbError=!!(st.error&&st.error.message), cs=isDbError?'unknown':(st.circuit_status||'unknown'), ec=isDbError?0:n(st.error_count), errHour=isDbError?0:n(st.errors_last_hour), err24h=isDbError?0:n(st.errors_last_24h), retries1h=isDbError?0:n(st.retries_last_hour), retries24h=isDbError?0:n(st.retries_last_24h), retryFailures1h=isDbError?0:n(st.retry_failures_1h), retryFailures24h=isDbError?0:n(st.retry_failures_24h), circuitTransitions2h=isDbError?0:n(st.circuit_transitions_2h), unknownErrors24h=isDbError?0:n(st.unknown_errors_24h), distinctFps5m=isDbError?0:n(st.distinct_fps_5m), distinctWorkflows5m=isDbError?0:n(st.distinct_workflows_5m);\nconst isStormLikely=distinctFps5m>=3, prevStorm=!!sd.heartbeatStormActive;let stormStarted=false, stormResolved=false, stormDurationMin=0;if(isStormLikely&&!prevStorm){stormStarted=true;sd.heartbeatStormDetectedAt=now;sd.heartbeatStormActive=true}if(!isStormLikely&&prevStorm){stormResolved=true;stormDurationMin=Math.round((now-(sd.heartbeatStormDetectedAt||now))/60000);delete sd.heartbeatStormDetectedAt;delete sd.heartbeatStormActive}\nconst lastErrorAt=isDbError?null:st.last_error_at, lastRetentionAt=isDbError?null:st.last_retention_at, retentionStale=!isDbError&&!!lastRetentionAt&&(now-new Date(lastRetentionAt).getTime())>36*60*60*1000, halfOpenResetMin=st.half_open_at?Math.max(0,10-Math.floor((now-new Date(st.half_open_at).getTime())/60000)):0;\nconst orphanState=orph.orphanState||'unknown', orphanCount=n(orph.orphanCount), hasOrphans=!!orph.hasOrphans, cachedCount=(sd.eventFailures&&sd.eventFailures.length)||0, droppedCount=sd.droppedCacheCount||0, isFlapping=circuitTransitions2h>=4, retryFailureActive=retryFailures1h>0;\nconst issueLabels={db:'DB unavailable',cache:'cached delivery failures pending',dms:'DMS ping failed',activation_api:'activation API uncertain',executions_api:'executions API unreachable',retention_stale:'retention stale'};\nconst controlPlaneIssues=[isDbError?'db':'',cachedCount>0?'cache':'',sd.lastDeadMansSwitchFailure?'dms':'',act.activationUncertain?'activation_api':'',orphanState==='api_error'?'executions_api':'',retentionStale?'retention_stale':''].filter(Boolean);\nconst controlPlane=controlPlaneIssues.length===0?'full':controlPlaneIssues.length<=2?'reduced':'impaired';\nconst controlPlaneText=controlPlaneIssues.length?controlPlane+' — '+controlPlaneIssues.map(k=>issueLabels[k]||k).join(', '):controlPlane;\nconst isDegraded=isDbError||cs==='open'||cs==='half_open'||cachedCount>0||!!sd.lastDeadMansSwitchFailure||['uncertain','api_error'].includes(orphanState)||!!act.activationUncertain||!!act.hasDeactivated||hasOrphans||retryFailureActive||isFlapping||retentionStale||isStormLikely, isCritical=isDbError||cs==='open';\nconst previousVerdict=sd.lastVerdict||'HEALTHY', currentVerdict=isCritical?'CRITICAL':(isDegraded?'DEGRADED':'HEALTHY'), isRecovery=['CRITICAL','DEGRADED'].includes(previousVerdict)&&currentVerdict==='HEALTHY'&&!isDbError;\nif(isDegraded&&previousVerdict==='HEALTHY')sd.lastDegradedSince=now;\nlet recoveryInfo='';if(isRecovery){const ms=sd.lastDegradedSince?now-sd.lastDegradedSince:0;const reasons=Array.isArray(sd.lastDegradedReasons)&&sd.lastDegradedReasons.length?' — '+sd.lastDegradedReasons.join(', '):'';recoveryInfo=' (degraded for '+dur(ms)+reasons+')';delete sd.lastDegradedSince;delete sd.lastDegradedReasons;}\nif(isDegraded)sd.lastDegradedReasons=[cs==='open'?'circuit_open':'',cs==='half_open'?'half_open':'',hasOrphans?'orphans':'',isStormLikely?'storm':'',isFlapping?'flapping':'',['uncertain','api_error'].includes(orphanState)?'dataMissing':'',retentionStale?'retention':'',cachedCount>0?'cache':'',act.activationIssue||act.activationUncertain?'activation':'',isDbError?'db':''].filter(Boolean);\nsd.lastVerdict=currentVerdict;\nconst verdict=isCritical?'🔴 CRITICAL':(isDegraded?'🟡 DEGRADED':'🟢 HEALTHY'), circuitIcon=cs==='closed'?'🟢':cs==='half_open'?'🟡':cs==='open'?'🔴':'⚪', circuitDisplay=cs==='half_open'?cs+' ('+ec+'/5 · resets in '+halfOpenResetMin+'m)':cs+' ('+ec+'/5)', retentionDisplay=retentionStale?'stale (last: '+dt(lastRetentionAt)+')':(lastRetentionAt?'ok (last: '+dt(lastRetentionAt)+')':'ok (no record)'), lastErrorDisplay=lastErrorAt?new Date(lastErrorAt).toLocaleString('en-PH',{timeZone:'Asia/Manila',hour:'2-digit',minute:'2-digit',hour12:false}):'none';\nlet topSrcLine='';if(err24h>0){try{const sources=typeof st.top_error_sources==='string'?JSON.parse(st.top_error_sources):(st.top_error_sources||[]);if(sources.length)topSrcLine='\\n📍 <b>Top Sources:</b> '+sources.slice(0,3).map(s=>h(s.workflow_name||'unknown')+' → '+h(s.failed_node||'unknown')+' ('+n(s.error_count)+')').join(', ')}catch(e){}}\nlet prefix='';if(isRecovery)prefix='✅ <b>RECOVERED</b> — System returned to HEALTHY from '+previousVerdict+recoveryInfo+'\\n\\n';else if(stormStarted)prefix='⛈ <b>ERROR STORM STARTED</b> — '+distinctFps5m+' distinct patterns in 5m\\n\\n';else if(stormResolved)prefix='✅ <b>ERROR STORM RESOLVED</b> — lasted '+stormDurationMin+'m\\n\\n';\nlet warn='';if(isStormLikely)warn+='\\n⛈ <b>Error Storm:</b> '+distinctFps5m+' distinct patterns across '+distinctWorkflows5m+' workflow(s) in 5m';if(isFlapping)warn+='\\n⚡ <b>Circuit Flapping:</b> '+circuitTransitions2h+' transitions in 2h';if(unknownErrors24h>=3)warn+='\\n⚠️ <b>Classifier Drift:</b> '+unknownErrors24h+' unknown-category errors in 24h';if(cachedCount>0){const counts={};(sd.eventFailures||[]).forEach(f=>{counts[f.eventType||f.deliveryKind||'alert_failed']=(counts[f.eventType||f.deliveryKind||'alert_failed']||0)+1});warn+='\\n⚠️ <b>Heartbeat Delivery Degraded:</b> '+Object.keys(counts).map(k=>k.replace(/_/g,' ')+' '+counts[k]).join(', ')}if(sd.lastDeadMansSwitchFailure)warn+='\\n⚠️ <b>DMS Failure:</b> <code>'+h(String(sd.lastDeadMansSwitchFailure).slice(0,250))+'</code>';if(act.activationDisplayText)warn+='\\n'+act.activationDisplayText;\nlet text=clamp(prefix+'💓 <b>SUPERVISOR — '+verdict+'</b>\\n\\n'+circuitIcon+' <b>Circuit:</b> '+circuitDisplay+'\\n🧭 <b>Control Plane:</b> '+h(controlPlaneText)+'\\n'+(sd.lastDeadMansSwitchFailure?'🔴':'🟢')+' <b>DMS:</b> '+(sd.lastDeadMansSwitchFailure?'failed (last cycle)':'ok (last cycle)')+'\\n'+(retentionStale?'🔴':'🟢')+' <b>Retention:</b> '+retentionDisplay+'\\n'+(act.activationConfigured?((act.activationIssue||act.activationUncertain)?'🔴':'🟢')+' <b>Workflows:</b> '+(act.activationIssue?act.activationMessage:act.expectedCount+'/'+act.expectedCount+' active'):'⚪ <b>Workflows:</b> not configured')+'\\n'+(orphanState==='found'?'🔴':orphanState==='none'?'🟢':'🟡')+' <b>Orphans:</b> '+(orphanState==='found'?orphanCount+' detected':orphanState)+'\\n📊 <b>Trend:</b> '+(errHour>=3?'🔴 spike':err24h>=10?'🟡 elevated':'🟢 stable')+'\\n⏱ <b>Last Error:</b> '+lastErrorDisplay+'\\n🔄 <b>Auto-Retries:</b> '+retries1h+' (1h) · '+retries24h+' (24h)\\n\\n<b>Errors:</b> '+errHour+' (1h) · '+err24h+' (24h)'+topSrcLine+warn+'\\n\\n<b>Timestamp:</b> '+ts());\nconst hashInput=JSON.stringify([cs,ec,bucket(errHour,3),bucket(err24h,5),isDbError,cachedCount,droppedCount,!!sd.lastDeadMansSwitchFailure,orphanState,orphanCount,!!act.activationUncertain,!!act.hasDeactivated,bucket(retries1h,2),bucket(retries24h,3),lastErrorAt?Math.floor(new Date(lastErrorAt).getTime()/(15*60*1000)):0,bucket(retryFailures1h,2),circuitTransitions2h,unknownErrors24h,retentionStale,isStormLikely,bucket(distinctFps5m,2),controlPlane]);\nconst messageHash=crypto.createHash('md5').update(hashInput).digest('hex'), isDuplicate=messageHash===(sd.lastHeartbeatHash||'');let shouldSend=false, sendReason='suppressed';if(isDbError){const last=sd.lastDbOutageAlertAt||0;if(now-last>=1800000){shouldSend=true;sendReason='database_unreachable';sd.lastDbOutageAlertAt=now}}else if(isRecovery){shouldSend=true;sendReason='recovery_to_healthy'}else if(stormStarted){shouldSend=true;sendReason='storm_started'}else if(stormResolved){shouldSend=true;sendReason='storm_resolved'}else if(isDegraded&&!isDuplicate){shouldSend=true;sendReason='degraded_state_changed'}else if(now-(sd.lastPulseAt||0)>=3300000){shouldSend=true;sendReason=isDegraded?'periodic_degraded_pulse':'hourly_healthy_pulse'}\nconst heartbeatLogPayload=JSON.stringify({isDegraded:String(isDegraded),circuit_status:cs,error_count:ec,errors_last_hour:errHour,errors_last_24h:err24h,last_error_at:lastErrorAt||'',retries_last_hour:retries1h,retries_last_24h:retries24h,retry_failures_1h:retryFailures1h,circuit_transitions_2h:circuitTransitions2h,unknown_errors_24h:unknownErrors24h,distinct_fps_5m:distinctFps5m,distinct_workflows_5m:distinctWorkflows5m,storm_active:String(isStormLikely),last_retention_at:lastRetentionAt||'',retention_stale:String(retentionStale),control_plane:controlPlane,control_plane_issues:controlPlaneIssues.join(','),sendReason,verdict,emergency_cache_count:cachedCount,dms_failure_active:String(!!sd.lastDeadMansSwitchFailure),orphan_state:orphanState,orphan_count:orphanCount,activation_uncertain:String(!!act.activationUncertain),activation_issue:String(!!act.activationIssue)});\nreturn[{json:{text,messageHash,isDuplicate,isDegraded,isCritical,verdict,shouldSend,sendReason,dbError:isDbError,circuit_status:cs,error_count:ec,errors_last_hour:errHour,errors_last_24h:err24h,last_error_at:lastErrorAt,retries_last_hour:retries1h,retries_last_24h:retries24h,retry_failures_1h:retryFailures1h,retry_failures_24h:retryFailures24h,circuit_transitions_2h:circuitTransitions2h,unknown_errors_24h:unknownErrors24h,distinct_fps_5m:distinctFps5m,distinct_workflows_5m:distinctWorkflows5m,storm_active:isStormLikely,last_retention_at:lastRetentionAt,retention_stale:retentionStale,control_plane:controlPlane,emergency_cache_count:cachedCount,dms_failure_active:!!sd.lastDeadMansSwitchFailure,orphan_state:orphanState,orphan_count:orphanCount,activation_uncertain:!!act.activationUncertain,activation_issue:!!act.activationIssue,heartbeatLogPayload}}];"
       },
-      "id": "code-eval-health-v1l",
+      "id": "48cc4c64-21a0-4c3a-948c-99a89586869e",
       "name": "Evaluate System Health",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        2150,
-        700
+        2656,
+        800
       ]
     },
     {
@@ -298,13 +333,13 @@
         },
         "options": {}
       },
-      "id": "if-should-send-v1l",
+      "id": "b2e3be23-aec3-49fb-a320-e4ac99674a42",
       "name": "Should Send?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [
-        2400,
-        650
+        2896,
+        752
       ]
     },
     {
@@ -312,19 +347,26 @@
         "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
         "text": "={{ $json.text }}",
         "additionalFields": {
-          "parse_mode": "HTML",
           "disable_notification": "={{ !$json.isDegraded && $json.sendReason !== 'recovery_to_healthy' }}",
-          "disable_web_page_preview": true
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
         }
       },
-      "id": "tg-heartbeat-v1l",
+      "id": "295c1494-826e-471a-975f-ec428e578cbb",
       "name": "Telegram (Heartbeat)",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.1,
       "position": [
-        2650,
-        600
+        3152,
+        704
       ],
+      "webhookId": "9ff0e075-4288-441d-ba48-fd5bb88c5480",
+      "credentials": {
+        "telegramApi": {
+          "id": "bcEYycJpgjmq4Bvf",
+          "name": "Supervisor TG"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
@@ -335,44 +377,49 @@
           "queryReplacement": "={{ $('Evaluate System Health').first().json.heartbeatLogPayload }}"
         }
       },
-      "id": "pg-log-heartbeat-v1l",
+      "id": "d8df606e-07b3-4286-b4dc-b68bc4a5cffd",
       "name": "Log Heartbeat Event",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        2900,
-        600
+        3408,
+        704
       ],
+      "credentials": {
+        "postgres": {
+          "id": "po5hLAdXZpOgltjN",
+          "name": "Supervisor Postgres"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "jsCode": "const sd=$getWorkflowStaticData('global');const ev=(()=>{try{return $('Evaluate System Health').first().json||{}}catch(e){return{}}})();if(ev.messageHash)sd.lastHeartbeatHash=ev.messageHash;if(ev.shouldSend)sd.lastPulseAt=Date.now();sd.eventFailures=[];sd.droppedCacheCount=0;return[{json:{cacheCleared:true,hashUpdated:!!ev.messageHash}}];"
       },
-      "id": "code-clear-cache-v1l",
+      "id": "079f54a1-39e3-4783-bbbe-e2b6ab08406d",
       "name": "Clear Local Cache",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        3150,
-        600
+        3648,
+        704
       ]
     },
     {
       "parameters": {
-        "method": "GET",
         "url": "={{ $('Evaluate System Health').first().json.isCritical ? $env.HEALTHCHECKS_PING_URL + '/fail' : $env.HEALTHCHECKS_PING_URL }}",
         "options": {
           "timeout": 10000
         }
       },
-      "id": "http-dms-complete-v1l",
+      "id": "d13ee6b2-8b37-43b7-b30b-500d4d7a270e",
       "name": "HTTP (DMS Complete)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        2400,
-        900
+        2896,
+        1008
       ],
       "onError": "continueErrorOutput"
     },
@@ -380,44 +427,45 @@
       "parameters": {
         "jsCode": "var complete=$input.first().json||{};var sd=$getWorkflowStaticData('global');var start={};try{start=$('HTTP (DMS Start)').first().json||{}}catch(e){}function err(x){return x&&x.error&&x.error.message?String(x.error.message):''}var se=err(start),ce=err(complete),bad=!!(se||ce),msg=se&&ce?'DMS start failed: '+se+' | DMS complete failed: '+ce:se?'DMS start failed: '+se:ce?'DMS complete failed: '+ce:'';if(bad)sd.lastDeadMansSwitchFailure=msg;else delete sd.lastDeadMansSwitchFailure;return[{json:{dmsFailure:bad,dmsOk:!bad,dmsStartOk:!se,dmsCompleteOk:!ce,dmsErrorMessage:msg}}];"
       },
-      "id": "code-check-dms-v1l",
+      "id": "36ce2d30-edee-46b8-a888-4d9570db4964",
       "name": "Check DMS Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        2650,
-        900
+        3152,
+        1008
       ]
     },
     {
       "parameters": {
         "jsCode": "const sd=$getWorkflowStaticData('global'),item=$input.first().json||{};if(!sd.eventFailures)sd.eventFailures=[];const sourceNode=item.node?.name||item.nodeName||item.error?.node?.name||item.failedNode||'unknown_delivery_node';const deliveryKind=sourceNode.includes('Telegram')?'telegram_delivery_failed':(sourceNode.includes('Log')||sourceNode.includes('Postgres'))?'postgres_log_failed':'heartbeat_delivery_failed';sd.eventFailures.push({timestamp:new Date().toISOString(),traceId:item.traceId||'unknown',eventType:deliveryKind,deliveryKind,sourceNode,source:'Heartbeat Monitor',workflowName:'Heartbeat Monitor',failedNode:sourceNode,reason:(item.error?.message||item.message||deliveryKind)+' at '+sourceNode});if(sd.eventFailures.length>50){sd.droppedCacheCount=(sd.droppedCacheCount||0)+(sd.eventFailures.length-50);sd.eventFailures=sd.eventFailures.slice(-50)}return[{json:{cached:true,count:sd.eventFailures.length,dropped:sd.droppedCacheCount||0,deliveryKind,sourceNode}}];"
       },
-      "id": "code-cache-hb-fail-v1l",
+      "id": "e3c512bb-2fdc-4580-b35d-791dbc8ebee7",
       "name": "Cache Alert Failure",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        3150,
-        350
+        3648,
+        464
       ]
     },
     {
       "parameters": {
         "content": "## 💓 Heartbeat Monitor V1 Lean (Round 22 Build)\n**21 executable nodes + 1 sticky. R22 internal hardening, zero new nodes.**\n\n- R22: top_error_sources rendered in heartbeat\n- R22: activation alerts are state-change/6h reminder based with editor links\n- R22: orphan API error alert throttled to 30m\n- R22: control-plane labels humanized and delivery cache grouped\n- R22: classifier drift warning restored; dead last_heartbeat_at/dataMissing removed\n- R21: orphan cleanup, recovery duration/reasons, tag-safe clamp",
-        "width": 720,
-        "height": 640
+        "height": 640,
+        "width": 720
       },
-      "id": "sticky-info-hb-v1l",
+      "id": "c0725768-146c-4f41-9fee-6711dfee1c03",
       "name": "Sticky Note",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
       "position": [
-        0,
-        -100
+        2848,
+        -288
       ]
     }
   ],
+  "pinData": {},
   "connections": {
     "Schedule Trigger": {
       "main": [
@@ -531,8 +579,7 @@
             "type": "main",
             "index": 0
           }
-        ],
-        []
+        ]
       ]
     },
     "Log Orphans": {
@@ -601,8 +648,7 @@
             "type": "main",
             "index": 0
           }
-        ],
-        []
+        ]
       ]
     },
     "Telegram (Activation Alert)": {
@@ -641,8 +687,7 @@
             "type": "main",
             "index": 0
           }
-        ],
-        []
+        ]
       ]
     },
     "Telegram (Heartbeat)": {
@@ -700,21 +745,16 @@
       ]
     }
   },
+  "active": true,
   "settings": {
     "executionOrder": "v1",
-    "executionTimeout": 120,
-    "saveExecutionProgress": true
+    "binaryMode": "separate"
   },
-  "staticData": null,
-  "tags": [
-    {
-      "name": "production-v1-lean"
-    },
-    {
-      "name": "supervisor"
-    },
-    {
-      "name": "heartbeat"
-    }
-  ]
+  "versionId": "4c22ab37-a734-44e5-acab-755dc416e6ff",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "22da58545622faa6c02ad360173659ae50818de9a11aee046593ea6a8484167e"
+  },
+  "id": "tKmCDVEK0yAkR9rN",
+  "tags": []
 }

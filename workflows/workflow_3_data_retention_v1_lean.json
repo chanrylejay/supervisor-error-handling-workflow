@@ -1,6 +1,5 @@
 {
   "name": "Data Retention V1 Lean",
-  "description": "R22 data retention workflow with oldest event data span and humanized notify reasons; preserves bounded cleanup, stale half-open repair, retention payload, and delivery/audit-aware timer.",
   "nodes": [
     {
       "parameters": {
@@ -13,75 +12,83 @@
           ]
         }
       },
-      "id": "trigger-schedule-ret-v1l",
+      "id": "ea7cc7ac-f85c-4d5c-98bd-6936b3e40526",
       "name": "Schedule Trigger",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [
-        0,
-        300
+        288,
+        512
       ]
     },
     {
       "parameters": {
         "operation": "executeQuery",
         "query": "WITH del_events AS (\n  DELETE FROM supervisor_events\n  WHERE id IN (\n    SELECT id FROM supervisor_events\n    WHERE created_at < NOW() - INTERVAL '90 days'\n    ORDER BY id\n    LIMIT 1000\n  )\n  RETURNING id\n),\nstale_circuit AS (\n  UPDATE circuit_state\n  SET status = 'closed', error_count = 0, updated_at = NOW(), half_open_at = NULL\n  WHERE circuit_key = 'supervisor'\n    AND status = 'open'\n    AND last_error_at < NOW() - INTERVAL '1 hour'\n    AND opened_at < NOW() - INTERVAL '1 hour'\n  RETURNING circuit_key, 'open' AS previous_status, status AS new_status\n),\nstale_half_open AS (\n  UPDATE circuit_state\n  SET status = 'closed', error_count = 0, updated_at = NOW(), half_open_at = NULL\n  WHERE circuit_key = 'supervisor'\n    AND status = 'half_open'\n    AND last_error_at < NOW() - INTERVAL '1 hour'\n    AND NOT EXISTS (SELECT 1 FROM stale_circuit)\n  RETURNING circuit_key, 'half_open' AS previous_status, status AS new_status\n),\nhalf_open_invariant_repair AS (\n  UPDATE circuit_state\n  SET half_open_at = NULL, updated_at = NOW()\n  WHERE circuit_key = 'supervisor'\n    AND status <> 'half_open'\n    AND half_open_at IS NOT NULL\n  RETURNING circuit_key\n),\nall_circuit_repairs AS (\n  SELECT * FROM stale_circuit\n  UNION ALL\n  SELECT * FROM stale_half_open\n),\ntransition_log AS (\n  INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, severity, status, payload)\n  SELECT\n    'retention-stale-circuit-' || FLOOR(EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT,\n    'circuit_transition',\n    'Data Retention',\n    'retention',\n    'warning',\n    'closed',\n    jsonb_build_object('from', previous_status, 'to', new_status, 'reason', 'retention_stale_circuit_reset')\n  FROM all_circuit_repairs\n  RETURNING id\n)\nSELECT\n  (SELECT COUNT(*) FROM del_events) AS deleted_events_count,\n  (SELECT COUNT(*) > 0 FROM all_circuit_repairs) AS stale_circuit_reset,\n  (SELECT COUNT(*) FROM transition_log) AS stale_circuit_transition_logged,\n  (SELECT COUNT(*) FROM stale_half_open) AS stale_half_open_reset_count,\n  (SELECT COUNT(*) FROM half_open_invariant_repair) AS half_open_invariant_repairs,\n  (SELECT COUNT(*) FROM supervisor_events) AS total_events,\n  (SELECT MIN(created_at) FROM supervisor_events) AS oldest_event_at,\n  (SELECT pg_size_pretty(pg_total_relation_size('supervisor_events'))) AS events_table_size,\n  (SELECT pg_total_relation_size('supervisor_events')) AS events_table_size_bytes,\n  (SELECT pg_size_pretty(pg_indexes_size('supervisor_events'))) AS events_index_size,\n  (SELECT pg_indexes_size('supervisor_events')) AS events_index_size_bytes,\n  (SELECT n_dead_tup FROM pg_stat_user_tables WHERE relname = 'supervisor_events') AS dead_tuples,\n  (SELECT n_live_tup FROM pg_stat_user_tables WHERE relname = 'supervisor_events') AS live_tuples,\n  (SELECT last_autovacuum FROM pg_stat_user_tables WHERE relname = 'supervisor_events') AS last_autovacuum,\n  (SELECT CASE WHEN COALESCE(n_live_tup,0)+COALESCE(n_dead_tup,0)=0 THEN 0 ELSE ROUND(100.0*COALESCE(n_dead_tup,0)/NULLIF(COALESCE(n_live_tup,0)+COALESCE(n_dead_tup,0),0),2) END FROM pg_stat_user_tables WHERE relname='supervisor_events') AS dead_tuple_pct,\n  (SELECT COUNT(*) FROM schema_versions WHERE version = 'v1_lean') AS schema_version_present,\n  (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('circuit_state', 'supervisor_events', 'schema_versions')) AS expected_tables_found",
-        "options": {
-          "alwaysOutputData": true
-        }
+        "options": {}
       },
-      "id": "pg-cleanup-v1l",
+      "id": "75c608e5-5d8d-488d-b7a4-80a16b6e6f0f",
       "name": "Postgres (Cleanup)",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        250,
-        300
+        544,
+        512
       ],
+      "credentials": {
+        "postgres": {
+          "id": "po5hLAdXZpOgltjN",
+          "name": "Supervisor Postgres"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "jsCode": "function htmlEscape(text) { return String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }\nfunction truncateRaw(text, max) { var value = String(text || ''); return value.length <= max ? value : value.slice(0, max - 1) + '…'; }\nfunction dt(x){return x?new Date(x).toLocaleString('en-PH',{timeZone:'Asia/Manila',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false}):'no record';}\nvar item = $input.first().json || {};\nvar staticData = $getWorkflowStaticData('global');\nvar isDbError = !!(item.error && typeof item.error === 'object' && item.error.message);\nvar tableSizeThresholdBytes = 50 * 1024 * 1024;\nif (isDbError) {\n  return [{ json: { report:'🔴 <b>DATA RETENTION — DB ERROR</b>\\n\\nCleanup query failed.\\n\\n<b>Error:</b> <code>'+htmlEscape(truncateRaw(String(item.error.message),500))+'</code>', isDbError:true, isLimitHit:false, deletedEvents:0, totalEvents:0, oldestEventAt:null, dataSpanDays:0, dataSpanDisplay:'unknown', eventsTableSize:'unknown', eventsTableSizeBytes:0, eventsIndexSize:'unknown', eventsIndexSizeBytes:0, deadTuples:0, liveTuples:0, deadTuplePct:0, lastAutovacuum:'unknown', deadTupleWarning:false, autovacuumStale:false, staleCircuitReset:false, staleCircuitTransitionLogged:0, staleHalfOpenResetCount:0, halfOpenInvariantRepairs:0, schemaVersionPresent:false, expectedTablesFound:0, schemaOk:false, tableSizeWarning:false, indexBloatWarning:false, shouldNotify:true, notifyReason:'db_error' } }];\n}\nvar deletedEvents=parseInt(item.deleted_events_count,10)||0;\nvar staleCircuitReset=item.stale_circuit_reset===true||item.stale_circuit_reset==='t'||item.stale_circuit_reset==='true';\nvar staleCircuitTransitionLogged=parseInt(item.stale_circuit_transition_logged,10)||0;\nvar staleHalfOpenResetCount=parseInt(item.stale_half_open_reset_count,10)||0;\nvar halfOpenInvariantRepairs=parseInt(item.half_open_invariant_repairs,10)||0;\nvar isLimitHit=deletedEvents>=1000;\nvar totalEvents=parseInt(item.total_events,10)||0;\nvar oldestEventAt=item.oldest_event_at||null;\nvar dataSpanDays=oldestEventAt?Math.round((Date.now()-new Date(oldestEventAt).getTime())/86400000):0;\nvar dataSpanDisplay=oldestEventAt?(dataSpanDays+' days (oldest: '+dt(oldestEventAt)+')'):'empty table';\nvar eventsTableSize=item.events_table_size||'unknown';\nvar eventsTableSizeBytes=parseInt(item.events_table_size_bytes,10)||0;\nvar eventsIndexSize=item.events_index_size||'unknown';\nvar eventsIndexSizeBytes=parseInt(item.events_index_size_bytes,10)||0;\nvar schemaVersionPresent=(parseInt(item.schema_version_present,10)||0)>0;\nvar expectedTablesFound=parseInt(item.expected_tables_found,10)||0;\nvar schemaOk=schemaVersionPresent&&expectedTablesFound===3;\nvar tableSizeWarning=eventsTableSizeBytes>tableSizeThresholdBytes;\nvar indexBloatWarning=eventsIndexSizeBytes>tableSizeThresholdBytes;\nvar deadTuples=parseInt(item.dead_tuples,10)||0;\nvar liveTuples=parseInt(item.live_tuples,10)||0;\nvar deadTuplePct=parseFloat(item.dead_tuple_pct)||0;\nvar lastAutovacuum=item.last_autovacuum||'never';\nvar deadTupleWarning=deadTuples>5000||deadTuplePct>20;\nvar autovacuumStale=false;\nif(lastAutovacuum==='never'&&totalEvents>100) autovacuumStale=true;\nelse if(lastAutovacuum!=='never'&&lastAutovacuum!=='unknown') autovacuumStale=(Date.now()-new Date(lastAutovacuum).getTime())>7*24*60*60*1000;\nvar now=Date.now();\nvar weeklyReportDue=((now-(staticData.lastRetentionReportAt||0))/(1000*60*60*24))>=7;\nvar shouldNotify=false, notifyReason='routine_silent';\nif(!schemaOk){shouldNotify=true;notifyReason='schema_drift';}\nelse if(isLimitHit){shouldNotify=true;notifyReason='limit_hit';}\nelse if(staleCircuitReset){shouldNotify=true;notifyReason='stale_circuit_reset';}\nelse if(halfOpenInvariantRepairs>0){shouldNotify=true;notifyReason='half_open_invariant_repaired';}\nelse if(tableSizeWarning){shouldNotify=true;notifyReason='table_size_warning';}\nelse if(indexBloatWarning){shouldNotify=true;notifyReason='index_bloat_warning';}\nelse if(deadTupleWarning){shouldNotify=true;notifyReason='dead_tuple_warning';}\nelse if(autovacuumStale){shouldNotify=true;notifyReason='autovacuum_stale';}\nelse if(weeklyReportDue){shouldNotify=true;notifyReason='weekly_summary';}\nvar report='🧹 <b>DATA RETENTION REPORT — V1 Lean</b>\\n\\n'\n + '<b>Deleted Events (90d):</b> '+deletedEvents+'\\n'\n + '<b>Remaining Events:</b> '+totalEvents+'\\n'\n + '<b>Data Span:</b> '+dataSpanDisplay+'\\n'\n + '<b>Events Table Size:</b> '+eventsTableSize+'\\n'\n + '<b>Events Index Size:</b> '+eventsIndexSize+'\\n'\n + '<b>Dead Tuples:</b> '+deadTuples+' ('+deadTuplePct+'% of total)\\n'\n + '<b>Live Tuples:</b> '+liveTuples+'\\n'\n + '<b>Last Autovacuum:</b> '+lastAutovacuum+'\\n'\n + '<b>Schema:</b> '+(schemaOk?'✅ v1_lean present, 3/3 tables':'⚠️ check needed — version: '+(schemaVersionPresent?'yes':'no')+', tables: '+expectedTablesFound+'/3');\nif(staleCircuitReset) report+='\\n\\n⚠️ <b>STALE CIRCUIT RESET:</b> Circuit was stale and auto-reset to closed.'+(staleHalfOpenResetCount>0?' Half-open reset count: '+staleHalfOpenResetCount+'.':'');\nif(halfOpenInvariantRepairs>0) report+='\\n\\n🛠 <b>CIRCUIT INVARIANT REPAIRED:</b> Cleared stale half_open_at on '+halfOpenInvariantRepairs+' row(s).';\nif(isLimitHit) report+='\\n\\n⚠️ <b>LIMIT HIT:</b> Events table hit the 1000-row deletion cap. Run retention again if backlog persists.';\nif(tableSizeWarning) report+='\\n\\n⚠️ <b>TABLE SIZE WARNING:</b> supervisor_events is '+eventsTableSize+' (threshold: 50 MB).';\nif(indexBloatWarning) report+='\\n\\n⚠️ <b>INDEX BLOAT WARNING:</b> supervisor_events indexes are '+eventsIndexSize+'. Consider running REINDEX.';\nif(deadTupleWarning) report+='\\n\\n⚠️ <b>DEAD TUPLE WARNING:</b> '+deadTuples+' dead tuples ('+deadTuplePct+'%) in supervisor_events. Last autovacuum: '+lastAutovacuum+'. Consider running VACUUM manually.';\nif(autovacuumStale) report+='\\n\\n⚠️ <b>AUTOVACUUM STALE:</b> Last autovacuum was '+(lastAutovacuum==='never'?'never':'over 7 days ago ('+lastAutovacuum+')')+'. Query planner stats may be outdated.';\nif(weeklyReportDue&&!staleCircuitReset&&!isLimitHit&&!tableSizeWarning&&!indexBloatWarning&&!deadTupleWarning&&!autovacuumStale&&schemaOk&&halfOpenInvariantRepairs===0) report+='\\n\\n📅 <i>Weekly scheduled report — no issues detected.</i>';\nreturn [{ json: { report, isDbError:false, isLimitHit, deletedEvents, totalEvents, oldestEventAt, dataSpanDays, dataSpanDisplay, eventsTableSize, eventsTableSizeBytes, eventsIndexSize, eventsIndexSizeBytes, deadTuples, liveTuples, deadTuplePct, lastAutovacuum, deadTupleWarning, autovacuumStale, staleCircuitReset, staleCircuitTransitionLogged, staleHalfOpenResetCount, halfOpenInvariantRepairs, schemaVersionPresent, expectedTablesFound, schemaOk, tableSizeWarning, indexBloatWarning, shouldNotify, notifyReason } }];"
       },
-      "id": "code-eval-cleanup-v1l",
+      "id": "2665cf18-0e23-47ed-a8e8-293c0eb550ec",
       "name": "Evaluate Cleanup",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        500,
-        300
+        800,
+        512
       ]
     },
     {
       "parameters": {
         "operation": "executeQuery",
         "query": "ANALYZE supervisor_events;\nANALYZE circuit_state;",
-        "options": {
-          "alwaysOutputData": true
-        }
+        "options": {}
       },
-      "id": "pg-analyze-v1l",
+      "id": "b4d97f72-985e-4548-b8df-96364951ffe1",
       "name": "Postgres (Analyze)",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        750,
-        300
+        1040,
+        512
       ],
+      "credentials": {
+        "postgres": {
+          "id": "po5hLAdXZpOgltjN",
+          "name": "Supervisor Postgres"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
         "jsCode": "function htmlEscape(text){return String(text||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}\nfunction truncateRaw(text,max){var value=String(text||'');return value.length<=max?value:value.slice(0,max-1)+'…';}\nfunction clampTelegramHtml(value,max){max=max||3900;var s=String(value||'');if(s.length<=max)return s;var note='\\n\\n⚠️ <i>Message truncated</i>';var cutPoint=max-note.length;var lastOpenBracket=s.lastIndexOf('<',cutPoint);var lastCloseBracket=s.lastIndexOf('>',cutPoint);if(lastOpenBracket>lastCloseBracket)cutPoint=lastOpenBracket;var truncated=s.substring(0,cutPoint);var openTags=[];var tagRegex=/<(\\/)?(b|i|code|a|pre|u|s)\\b[^>]{0,200}>/gi;var match;while((match=tagRegex.exec(truncated))!==null){if(match[1]==='/'){if(openTags.length>0)openTags.pop();}else openTags.push(match[2]);}for(var ti=openTags.length-1;ti>=0;ti--)truncated+='</'+openTags[ti]+'>';return truncated+note;}\nfunction formatTimestamp(){return new Date().toLocaleString('en-PH',{timeZone:'Asia/Manila',year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});}\nvar reasonLabels={schema_drift:'Schema drift detected',limit_hit:'Deletion cap reached (1000 rows)',stale_circuit_reset:'Stale circuit auto-reset to closed',half_open_invariant_repaired:'Circuit invariant repaired',table_size_warning:'Table size exceeds 50 MB',index_bloat_warning:'Index bloat detected',dead_tuple_warning:'Dead tuple threshold exceeded',autovacuum_stale:'Autovacuum overdue (>7 days)',weekly_summary:'Scheduled weekly report',analyze_failed:'ANALYZE command failed',db_error:'Database error during cleanup',routine_silent:'Routine silent run'};\nvar item=$input.first().json||{};\nvar evalData=(()=>{try{return $('Evaluate Cleanup').first().json||{};}catch(e){return{};}})();\nvar report=evalData.report||'🧹 <b>DATA RETENTION REPORT</b>\\n\\nNo cleanup report was generated.';\nvar analyzeError=!!(item.error&&typeof item.error==='object'&&item.error.message);\nif(analyzeError)report+='\\n\\n⚠️ <b>ANALYZE FAILED:</b> <code>'+htmlEscape(truncateRaw(String(item.error.message),500))+'</code>';\nelse report+='\\n\\n✅ <b>ANALYZE:</b> completed successfully.';\nvar shouldNotify=!!evalData.shouldNotify;\nvar notifyReason=evalData.notifyReason||'routine_silent';\nif(analyzeError&&!shouldNotify){shouldNotify=true;notifyReason='analyze_failed';}\nvar reasonLabel=reasonLabels[notifyReason]||String(notifyReason).replace(/_/g,' ');\nif(shouldNotify){report=report.replace('\\n\\n','\\n📋 <b>Reason:</b> '+htmlEscape(reasonLabel)+'\\n\\n');}\nreport+='\\n\\n<b>Timestamp:</b> '+formatTimestamp();\nreport=clampTelegramHtml(report);\nvar baseHasWarnings=!!(evalData.isDbError||analyzeError||!evalData.schemaOk||evalData.isLimitHit||evalData.staleCircuitReset||evalData.tableSizeWarning||evalData.indexBloatWarning||evalData.deadTupleWarning||evalData.autovacuumStale||(evalData.halfOpenInvariantRepairs||0)>0);\nvar retentionPayloadBase={ baseHasWarnings:String(baseHasWarnings), deleted_events:evalData.deletedEvents, total_events:evalData.totalEvents, oldest_event_at:evalData.oldestEventAt||'', data_span_days:evalData.dataSpanDays||0, data_span_display:evalData.dataSpanDisplay||'', events_table_size:evalData.eventsTableSize, events_index_size:evalData.eventsIndexSize, dead_tuples:evalData.deadTuples, live_tuples:evalData.liveTuples, dead_tuple_pct:evalData.deadTuplePct, last_autovacuum:evalData.lastAutovacuum||'unknown', autovacuum_stale:String(evalData.autovacuumStale), stale_circuit_reset:String(evalData.staleCircuitReset), stale_circuit_transition_logged:evalData.staleCircuitTransitionLogged, stale_half_open_reset_count:evalData.staleHalfOpenResetCount||0, half_open_invariant_repairs:evalData.halfOpenInvariantRepairs||0, limit_hit:String(evalData.isLimitHit), schema_ok:String(evalData.schemaOk), schema_version_present:String(evalData.schemaVersionPresent), expected_tables_found:evalData.expectedTablesFound, analyze_ok:String(!analyzeError), table_size_warning:String(evalData.tableSizeWarning), index_bloat_warning:String(evalData.indexBloatWarning), dead_tuple_warning:String(evalData.deadTupleWarning), notify_reason:notifyReason, notify_reason_label:reasonLabel, notified:String(shouldNotify) };\nreturn [{ json: { ...evalData, report, analyzeOk:!analyzeError, analyzeErrorMessage:analyzeError?item.error.message:'', shouldNotify, notifyReason, notifyReasonLabel:reasonLabel, baseHasWarnings, retentionPayloadBase:JSON.stringify(retentionPayloadBase) } }];"
       },
-      "id": "code-check-analyze-v1l",
+      "id": "c80d92dd-0740-424d-ad81-bbb23362549e",
       "name": "Check Analyze Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1000,
-        300
+        1296,
+        512
       ]
     },
     {
@@ -107,13 +114,13 @@
         },
         "options": {}
       },
-      "id": "if-should-notify-v1l",
+      "id": "d32e0e2c-200f-4e49-8984-caa3f73f9fef",
       "name": "Should Notify?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [
-        1250,
-        300
+        1552,
+        512
       ]
     },
     {
@@ -121,19 +128,26 @@
         "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
         "text": "={{ $json.report }}",
         "additionalFields": {
-          "parse_mode": "HTML",
           "disable_notification": true,
-          "disable_web_page_preview": true
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
         }
       },
-      "id": "tg-retention-report-v1l",
+      "id": "04d16b69-c45d-4ad9-8cc3-1c953116eb99",
       "name": "Telegram (Retention Report)",
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.1,
       "position": [
-        1500,
-        200
+        1792,
+        416
       ],
+      "webhookId": "71e06c76-f6a7-4d47-a31d-0daa8ff24d59",
+      "credentials": {
+        "telegramApi": {
+          "id": "bcEYycJpgjmq4Bvf",
+          "name": "Supervisor TG"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
@@ -141,48 +155,55 @@
         "operation": "executeQuery",
         "query": "INSERT INTO supervisor_events (trace_id, event_type, workflow_name, execution_id, severity, status, payload)\nVALUES (\n  'retention-' || FLOOR(EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT,\n  'retention_completed',\n  'Data Retention',\n  'retention',\n  CASE WHEN ($1::jsonb)->>'hasWarnings' = 'true' THEN 'warning' ELSE 'info' END,\n  CASE WHEN ($1::jsonb)->>'hasWarnings' = 'true' THEN 'completed_with_warnings' ELSE 'completed' END,\n  $1::jsonb\n)",
         "options": {
-          "queryReplacement": "={{ (() => { const base = JSON.parse($('Check Analyze Result').first().json.retentionPayloadBase || '{}'); const delivered = (() => { try { return !!$('Telegram (Retention Report)').first().json.message_id; } catch(e) { return false; } })(); base.telegram_delivered = String(delivered); base.hasWarnings = String(base.baseHasWarnings === 'true' || ($('Check Analyze Result').first().json.shouldNotify && !delivered)); delete base.baseHasWarnings; return JSON.stringify(base); })() }}"
+          "queryReplacement": "={{ (() => { const base = JSON.parse($('Check Analyze Result').first().json.retentionPayloadBase || '{}'); const delivered = (() => { try { const tg=$('Telegram (Retention Report)').first().json; return !!(tg && !tg.error && (tg.message_id || tg.ok || (tg.result && tg.result.message_id))); } catch(e) { return false; } })(); base.telegram_delivered = String(delivered); base.hasWarnings = String(base.baseHasWarnings === 'true' || ($('Check Analyze Result').first().json.shouldNotify && !delivered)); delete base.baseHasWarnings; return JSON.stringify(base); })() }}"
         }
       },
-      "id": "pg-log-retention-v1l",
+      "id": "679acf8d-358a-4e1f-918f-71940c00e03d",
       "name": "Log Retention Completed",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        1750,
-        300
+        2048,
+        512
       ],
+      "credentials": {
+        "postgres": {
+          "id": "po5hLAdXZpOgltjN",
+          "name": "Supervisor Postgres"
+        }
+      },
       "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "jsCode": "var staticData=$getWorkflowStaticData('global');\nvar evalData=(()=>{try{return $('Check Analyze Result').first().json||{};}catch(e){return{};}})();\nvar tgResult=(()=>{try{return $('Telegram (Retention Report)').first().json;}catch(e){return null;}})();\nvar logResult=$input.first().json||{};\nvar delivered=!!(tgResult&&tgResult.message_id);\nvar logOk=!(logResult.error&&logResult.error.message);\nif(evalData.shouldNotify&&delivered&&logOk)staticData.lastRetentionReportAt=Date.now();\nreturn [{json:{done:true,notified:!!evalData.shouldNotify,delivered,logOk,notifyReason:evalData.notifyReason||'silent'}}];"
+        "jsCode": "var staticData=$getWorkflowStaticData('global');\nvar evalData=(()=>{try{return $('Check Analyze Result').first().json||{};}catch(e){return{};}})();\nvar tgResult=(()=>{try{return $('Telegram (Retention Report)').first().json;}catch(e){return null;}})();\nvar logResult=$input.first().json||{};\nvar delivered=!!(tgResult&&!tgResult.error&&(tgResult.message_id||tgResult.ok||(tgResult.result&&tgResult.result.message_id)));\nvar logOk=!(logResult.error&&logResult.error.message);\nif(evalData.shouldNotify&&delivered&&logOk)staticData.lastRetentionReportAt=Date.now();\nreturn [{json:{done:true,notified:!!evalData.shouldNotify,delivered,logOk,notifyReason:evalData.notifyReason||'silent'}}];"
       },
-      "id": "code-update-report-ts-v1l",
+      "id": "00ad594c-0ef1-4755-8ec5-97289292e296",
       "name": "Update Report Timestamp",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        2000,
-        300
+        2288,
+        512
       ]
     },
     {
       "parameters": {
         "content": "## 🧹 Data Retention V1 Lean (Round 22 Build)\n**Every 12h: Cleanup → Evaluate → Analyze → Notify? → Log → Done**\n\n**9 executable nodes + 1 sticky. R22 internal hardening, zero new nodes.**\n\n- R22: Oldest event age / data span added\n- R22: notifyReason labels humanized\n- R21: top-line notify reason retained\n- R20/R19: stale half_open circuit safety reset\n- R20/R19: half_open_at invariant repair\n- R17: telegram_delivered payload + delivery/audit-aware weekly timer\n- Bounded delete: 90 days, LIMIT 1000",
-        "width": 640,
-        "height": 580
+        "height": 580,
+        "width": 640
       },
-      "id": "sticky-ret-v1l",
+      "id": "2c36b58f-7930-489a-955d-2705f62475f8",
       "name": "Sticky Note",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
       "position": [
-        0,
-        -60
+        928,
+        -176
       ]
     }
   ],
+  "pinData": {},
   "connections": {
     "Schedule Trigger": {
       "main": [
@@ -308,21 +329,16 @@
       ]
     }
   },
+  "active": true,
   "settings": {
     "executionOrder": "v1",
-    "executionTimeout": 180,
-    "saveExecutionProgress": true
+    "binaryMode": "separate"
   },
-  "staticData": null,
-  "tags": [
-    {
-      "name": "production-v1-lean"
-    },
-    {
-      "name": "supervisor"
-    },
-    {
-      "name": "data-retention"
-    }
-  ]
+  "versionId": "685b4f3d-84e0-403f-bc2e-646e53848035",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "22da58545622faa6c02ad360173659ae50818de9a11aee046593ea6a8484167e"
+  },
+  "id": "Mva8zjwGbbu9KnTQ",
+  "tags": []
 }
