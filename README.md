@@ -471,14 +471,17 @@ This system was hardened across **22 review cycles** by 2 independent AI agents 
 ## Repository Structure
 
 ```
-supervisor-error-handling/
+supervisor-error-handling-workflow/
 ├── README.md
-├── DEPLOYMENT_GUIDE.md
 ├── LICENSE
-├── schema.sql
-├── workflow_1_supervisor_core.json
-├── workflow_2_heartbeat_monitor.json
-└── workflow_3_data_retention.json
+├── database/
+│   └── schema.sql
+├── docs/
+│   └── deployment-guide.md
+└── workflows/
+    ├── workflow_1_supervisor_core_v1_lean.json
+    ├── workflow_2_heartbeat_monitor_v1_lean.json
+    └── workflow_3_data_retention_v1_lean.json
 ```
 
 ***
